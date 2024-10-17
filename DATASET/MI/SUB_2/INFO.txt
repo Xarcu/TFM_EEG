@@ -1,0 +1,27 @@
+FERRAN
+
+RIGHT
+- s1: green, no noise
+- s2: green, no noise
+- s3: green, no noise
+- s4: green, no noise
+- s5: green, no noise (maybe he was disperse)
+- s6: green, no noise
+
+
+LEFT
+- s1: green, some noise
+- s2: green, some noise
+- s3: green, some noise
+- s4: green, some noise
+- s5: green, some noise
+- s6: green, some noise
+
+
+RANDOM
+- s1: green, some noise
+- s2: green, some noise
+- s3: green, some noise
+- s4: green, some noise
+- s5: green, some noise
+- s6: green, some noise
