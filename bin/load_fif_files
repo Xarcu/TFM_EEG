@@ -1,5 +1,7 @@
 # python "C:\Users\Ferran\Desktop\TFM\TFM_EEG\bin\load_fif_files" -f  "C:\Users\Ferran\Desktop\TFM\TFM_EEG\DATASET\MI\SUB_2\ICA" -o "C:\Users\Ferran\Desktop\TFM\TFM_EEG\DATASET\MI\SUB_2\ICA\ICA_plots"
 
+#!/usr/bin/env python3
+
 import os
 import argparse
 import mne
@@ -30,6 +32,7 @@ def load_and_visualize_fif_files(base_dir, output_dir):
                 elif file.endswith('_raw.fif'):
                     raw_file = os.path.join(subject_path, file)
 
+            # Inspect raw file
             if raw_file:
                 print(f"Loading raw file: {raw_file}")
                 raw = mne.io.read_raw_fif(raw_file, preload=True)
@@ -38,6 +41,7 @@ def load_and_visualize_fif_files(base_dir, output_dir):
                 raw.filter(l_freq=1.0, h_freq=40.0)
 
                 # Check basic info
+                print("Raw data info:")
                 print(raw.info)
                 print(f"Data shape: {raw.get_data().shape}")
 
@@ -59,6 +63,7 @@ def load_and_visualize_fif_files(base_dir, output_dir):
             else:
                 print(f"No raw file found in {subject_path}")
 
+            # Inspect ICA file
             if ica_file:
                 print(f"Loading ICA file: {ica_file}")
                 ica = mne.preprocessing.read_ica(ica_file)
