@@ -1,3 +1,5 @@
+# python "C:\Users\Ferran\Desktop\TFM\TFM_EEG\bin\load_fif_files" -f  "C:\Users\Ferran\Desktop\TFM\TFM_EEG\DATASET\MI\SUB_2\ICA" -o "C:\Users\Ferran\Desktop\TFM\TFM_EEG\DATASET\MI\SUB_2\ICA\ICA_plots"
+
 import os
 import argparse
 import mne

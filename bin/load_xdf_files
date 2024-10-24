@@ -1,3 +1,5 @@
+#  python "C:\Users\Ferran\Desktop\TFM\TFM_EEG\bin\load_xdf_files"  -b  "C:/Users/Ferran/Desktop/TFM/TFM_EEG/DATASET/MI/SUB_2" -o  "C:\Users\Ferran\Desktop\TFM\TFM_EEG\DATASET\MI\SUB_2\ICA"
+
 import argparse
 import numpy as np
 import mne
