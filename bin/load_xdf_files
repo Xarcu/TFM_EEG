@@ -1,0 +1,232 @@
+import argparse
+import numpy as np
+import mne
+from scipy import signal
+from scipy.signal import butter, filtfilt, iirnotch, detrend
+from definitions import CHAN_LOC
+import pyxdf  # For loading .xdf files
+import matplotlib.pyplot as plt
+import os
+import re
+
+def load_xdf_file(filepath):
+    """Load the XDF file using pyxdf."""
+    streams, header = pyxdf.load_xdf(filepath)
+    return streams, header
+
+def find_xdf_files(base_dir):
+    """
+    Find all .xdf files within the given directory and its subdirectories.
+
+    Parameters:
+    base_dir : str
+        The base directory to start the search from.
+
+    Returns:
+    file_paths : list
+        List of paths to .xdf files.
+    """
+    file_paths = []
+    for root, dirs, files in os.walk(base_dir):
+        for file in files:
+            if file.endswith(".xdf"):
+                file_paths.append(os.path.join(root, file))
+    return file_paths
+
+
+def process_all_xdf_files(base_dir, base_save_dir):
+    """
+    Process all .xdf files in the LEFT and RIGHT directories by applying perform_ICA.
+
+    Parameters:
+    base_dir : str
+        The base directory containing the LEFT and RIGHT folders.
+    """
+    left_dir = os.path.join(base_dir, 'LEFT')
+    right_dir = os.path.join(base_dir, 'RIGHT')
+
+    # Find all .xdf files in the LEFT and RIGHT directories
+    left_files = find_xdf_files(left_dir)
+    right_files = find_xdf_files(right_dir)
+
+    print(f"Found {len(left_files)} files in LEFT directory.")
+    print(f"Found {len(right_files)} files in RIGHT directory.")
+
+    # Process LEFT files (side_identifier = 1)
+    for left_file in left_files:
+        print(f"Processing {left_file}...")
+        streams_L, header_L = load_xdf_file(left_file)
+        try:
+            EEG_DATA_L, ICA_L = perform_ICA(streams_L, 1, left_file,base_save_dir )
+        except Exception as e:
+            print(f"Error processing {left_file}: {e}")
+
+    # Process RIGHT files (side_identifier = 2)
+    for right_file in right_files:
+        print(f"Processing {right_file}...")
+        streams_R, header_R = load_xdf_file(right_file)
+        try:
+            EEG_DATA_R, ICA_R = perform_ICA(streams_R, 2, right_file,base_save_dir)
+        except Exception as e:
+            print(f"Error processing {right_file}: {e}")
+
+
+
+def perform_ICA(streams, side_identifier, xdf_filename, base_save_dir, trim_samples=(0, 0)):
+    """
+    Perform ICA on EEG data and save the ICA solution and filtered raw EEG data with unique filenames.
+
+    Parameters:
+    streams : list
+        List containing the EEG data (as dictionaries).
+    side_identifier : int
+        1 for Left (L) side, 2 for Right (R) side, used to differentiate the filenames.
+    xdf_filename : str
+        The original filename of the .xdf file to extract subject and session info from.
+    base_save_dir : str
+        The base directory where the processed data should be saved.
+    trim_samples : tuple
+        Tuple containing the number of samples to trim from the beginning and the end.
+
+    Returns:
+    raw : mne.io.Raw
+        The raw EEG data after preprocessing.
+    ica : mne.preprocessing.ICA
+        The fitted ICA solution.
+    timestamps : np.ndarray
+        The relevant time stamps from the streams.
+    relevant_time_series : np.ndarray
+        The time series corresponding to the relevant time stamps.
+    """
+    # Check the structure of the streams
+    print(f"Length of the streams list: {len(streams)}")
+
+    # Initialize variables
+    data = None
+    sampling_rate = None
+    timestamps = None
+
+    # Use the second stream if it has 10 channels and valid sampling rate
+    first_stream_data = np.array(streams[0]['time_series'])
+    second_stream_data = np.array(streams[1]['time_series']) if len(streams) > 1 else None
+
+    if second_stream_data is not None and second_stream_data.shape[1] == 10 and streams[1]['info']['effective_srate'] > 0:
+        data = second_stream_data
+        sampling_rate = streams[1]['info']['effective_srate']
+        timestamps = np.array(streams[1]['time_stamps'])
+        print("Using second stream with shape:", data.shape)
+    else:
+        raise ValueError("No valid data found in the streams.")
+
+    # Ensure valid numeric data
+    if not isinstance(data, np.ndarray) or not np.issubdtype(data.dtype, np.number):
+        raise ValueError("No valid numeric data found in any of the streams.")
+
+    # Trim the data and timestamps
+    if trim_samples[0] > 0 or trim_samples[1] > 0:
+        # Ensure we don't trim more than available
+        trim_start = min(trim_samples[0], data.shape[0])
+        trim_end = min(trim_samples[1], data.shape[0])
+        
+        # Trim the data
+        data = data[trim_start:data.shape[0] - trim_end]
+        
+        # Trim the timestamps as well
+        if timestamps is not None:
+            timestamps = timestamps[trim_start:len(timestamps) - trim_end]
+
+    # Create a RawArray object for MNE
+    ch_names = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4', 'GND']
+    info = mne.create_info(ch_names=ch_names, sfreq=sampling_rate, ch_types='eeg')
+
+    raw = mne.io.RawArray(data.T, info)  # Transpose data to fit MNE format (channels x samples)
+
+    # Set montage
+    montage = mne.channels.make_dig_montage(ch_pos={
+        'F3': (-39, 0.33333, 0), 
+        'Fz': (0, 0.25556, 0),
+        'F4': (39, 0.33333, 0),
+        'C3': (-90, 0.25556, 0),
+        'Cz': (90, 0, 0),
+        'C4': (90, 0.25556, 0),
+        'P3': (-141, 0.33333, 0),
+        'Pz': (180, 0.25556, 0),
+        'P4': (141, 0.33333, 0),
+        'GND': (-162, 0.51111, 0)
+    })
+    raw.set_montage(montage)
+
+    # High-pass filter the data
+    raw.filter(l_freq=0.3, h_freq=30)
+
+    # Perform ICA
+    n_channels = data.shape[1]
+    ica = mne.preprocessing.ICA(n_components=n_channels, random_state=97, max_iter=800)
+    ica.fit(raw)
+
+    # Extract subject and session info from xdf_filename
+    match = re.search(r'sub-(P\d+)_ses-(S\d+)', xdf_filename)
+    if match:
+        subject_id = match.group(1)
+        session_id = match.group(2)
+    else:
+        raise ValueError("Invalid XDF filename format. Could not extract subject and session IDs.")
+
+    # Determine side label (L or R)
+    side_label = 'L' if side_identifier == 1 else 'R'
+
+    # Create dynamic save directory based on the side, subject, and session
+    save_dir = os.path.join(base_save_dir, side_label, f"sub-{subject_id}", f"ses-{session_id}")
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Save the ICA solution
+    ica_filename = os.path.join(save_dir, f"SUB2_ses_{session_id}_{side_label}_ica.fif")
+    try:
+        ica.save(ica_filename)
+        print(f"ICA solution saved to {ica_filename}")
+    except Exception as e:
+        print(f"Error saving ICA solution: {e}")
+
+    # Save the raw EEG data
+    raw_filename = os.path.join(save_dir, f"SUB2_ses_{session_id}_{side_label}_raw.fif")
+    try:
+        raw.save(raw_filename, overwrite=True)
+        print(f"Raw EEG data saved to {raw_filename}")
+    except Exception as e:
+        print(f"Error saving raw EEG data: {e}")
+
+    # Return the raw object, ICA object, timestamps, and relevant time series data
+    relevant_time_series = data.shape[0]
+    return raw, ica, timestamps, relevant_time_series
+
+
+
+# Define the ICA processing and other helper functions (perform_ICA, filtering, etc.)
+# (Omitted here for brevity but should be included in your actual script.)
+
+# Main execution
+if __name__ == "__main__":
+    # Set up argument parsing
+    parser = argparse.ArgumentParser(
+        description="Process XDF files and apply ICA filtering. Save the ICA solution and filtered data."
+    )
+    parser.add_argument(
+        '-f', '--input_folder', 
+        required=True, 
+        help="Input folder containing the LEFT and RIGHT subdirectories with .xdf files."
+    )
+    parser.add_argument(
+        '-o', '--output_folder', 
+        required=True, 
+        help="Output folder to save the ICA-filtered data and results."
+    )
+
+    # Parse the command-line arguments
+    args = parser.parse_args()
+
+    # Get the input and output directories from the arguments
+    input_folder = args.input_folder
+    output_folder = args.output_folder
+
+    # Process all XDF files with the provided directories
+    process_all_xdf_files(input_folder, output_folder)
