@@ -167,18 +167,18 @@ def perform_ICA(streams, side_identifier, xdf_filename, base_save_dir, trim_samp
 
 
         # Create the full paths for saving the raw and ICA files
-        save_path_raw = os.path.join(output_dir, f"{filename_prefix}_filtered_raw.fif")
+        save_path_raw = os.path.join(output_dir, f"{filename_prefix}_raw.fif")
         save_path_ica = os.path.join(output_dir, f"{filename_prefix}_ica.fif")
 
         # Save files if they don't already exist
         if not os.path.exists(save_path_raw):
-            filtered_raw.save(save_path_raw, overwrite=False)
+            filtered_raw.save(save_path_raw, overwrite=True)
             print(f"Filtered raw data saved to: {save_path_raw}")
         else:
             print(f"File {save_path_raw} already exists. Skipping save.")
 
         if not os.path.exists(save_path_ica):
-            ica.save(save_path_ica, overwrite=False)
+            ica.save(save_path_ica, overwrite=True)
             print(f"ICA solution saved to: {save_path_ica}")
         else:
             print(f"File {save_path_ica} already exists. Skipping save.")
