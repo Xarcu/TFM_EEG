@@ -1,0 +1,96 @@
+import os
+import argparse
+import mne
+import matplotlib.pyplot as plt
+
+def load_and_visualize_fif_files(base_dir, output_dir):
+    """Load and visualize .fif files in the given directory, saving plots to output_dir."""
+    left_dir = os.path.join(base_dir, 'L')
+    right_dir = os.path.join(base_dir, 'R')
+
+    for side in ['L', 'R']:
+        side_dir = left_dir if side == 'L' else right_dir
+        if not os.path.exists(side_dir):
+            print(f"Directory not found: {side_dir}")
+            continue
+
+        for subject_folder in sorted(os.listdir(side_dir)):
+            subject_path = os.path.join(side_dir, subject_folder)
+
+            if not os.path.isdir(subject_path):
+                continue
+
+            ica_file = None
+            raw_file = None
+            for file in os.listdir(subject_path):
+                if file.endswith('_ica.fif'):
+                    ica_file = os.path.join(subject_path, file)
+                elif file.endswith('_raw.fif'):
+                    raw_file = os.path.join(subject_path, file)
+
+            if raw_file:
+                print(f"Loading raw file: {raw_file}")
+                raw = mne.io.read_raw_fif(raw_file, preload=True)
+
+                # Bandpass filter the raw data
+                raw.filter(l_freq=1.0, h_freq=40.0)
+
+                # Check basic info
+                print(raw.info)
+                print(f"Data shape: {raw.get_data().shape}")
+
+                # Skip the first 5 seconds of data
+                n_samples = int(raw.info['sfreq'] * 5)  # Number of samples in 5 seconds
+                data, times = raw[:, n_samples:]  # Get data from 5 seconds onward
+
+                # Plotting raw data manually
+                plt.figure(figsize=(15, 5))
+                plt.plot(times, data.T)  # Transpose to have channels on the y-axis
+                plt.title(f"Raw Data - Subject: {subject_folder} - Side: {side}")
+                plt.xlabel('Time (s)')
+                plt.ylabel('EEG Signal Amplitude (µV)')  # Indicate units, adjust as needed
+                plt.grid()
+                raw_plot_path = os.path.join(output_dir, f"raw_data_subject_{subject_folder}_side_{side}.png")
+                plt.savefig(raw_plot_path)
+                plt.close()
+                print(f"Saved raw plot to: {raw_plot_path}")
+            else:
+                print(f"No raw file found in {subject_path}")
+
+            if ica_file:
+                print(f"Loading ICA file: {ica_file}")
+                ica = mne.preprocessing.read_ica(ica_file)
+
+                if ica.n_components_ > 0:
+                    print(f"Number of ICA components: {ica.n_components_}")
+
+                    # Attempt to retrieve the mixing matrix
+                    mixing_matrix = ica.mixing_matrix_
+                    print(f"Mixing matrix shape: {mixing_matrix.shape}")
+
+                    # Plotting the mixing matrix
+                    plt.figure(figsize=(15, 5))
+                    plt.imshow(mixing_matrix, aspect='auto', cmap='viridis', origin='lower')
+                    plt.colorbar(label='Weight')
+                    plt.title(f"ICA Mixing Matrix - Subject: {subject_folder} - Side: {side}")
+                    plt.xlabel('ICA Components')
+                    plt.ylabel('EEG Channels')
+                    mixing_matrix_plot_path = os.path.join(output_dir, f"ica_mixing_matrix_subject_{subject_folder}_side_{side}.png")
+                    plt.savefig(mixing_matrix_plot_path)
+                    plt.close()
+                    print(f"Saved ICA mixing matrix plot to: {mixing_matrix_plot_path}")
+
+                else:
+                    print(f"No ICA components found for {subject_folder}.")
+            else:
+                print(f"No ICA file found in {subject_path}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Load and visualize .fif files from processed data.")
+    parser.add_argument('-f', '--base_dir', required=True, help='Base directory containing LEFT and RIGHT preprocessed files.')
+    parser.add_argument('-o', '--output_dir', required=True, help='Directory to save the visualizations.')
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    load_and_visualize_fif_files(args.base_dir, args.output_dir)
