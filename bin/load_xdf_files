@@ -187,8 +187,8 @@ def perform_ICA(streams, side_identifier, xdf_filename, base_save_dir, trim_samp
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="XDF EEG File Processor")
-    parser.add_argument('--base_dir', required=True, help='Base directory containing LEFT and RIGHT folders with .xdf files.')
-    parser.add_argument('--output_dir', required=True, help='Output directory to save processed files.')
+    parser.add_argument('-b','--base_dir', required=True, help='Base directory containing LEFT and RIGHT folders with .xdf files.')
+    parser.add_argument('-o','--output_dir', required=True, help='Output directory to save processed files.')
     args = parser.parse_args()
 
     process_all_xdf_files(args.base_dir, args.output_dir)
