@@ -1,42 +1,28 @@
-#  python "C:\Users\Ferran\Desktop\TFM\TFM_EEG\bin\load_xdf_files"  -b  "C:/Users/Ferran/Desktop/TFM/TFM_EEG/DATASET/MI/SUB_2" -o  "C:\Users\Ferran\Desktop\TFM\TFM_EEG\DATASET\MI\SUB_2\ICA"
-
 import argparse
 import numpy as np
 import mne
 from scipy.signal import butter, filtfilt, iirnotch, detrend
-import pyxdf  # For loading .xdf files
+import pyxdf
 import os
 import re
+import json
 
 def load_xdf_file(filepath):
-    """Load the XDF file using pyxdf."""
+    """Load the XDF file using pyxdf and log details about each stream."""
     streams, header = pyxdf.load_xdf(filepath)
     print(f"Loaded XDF file: {filepath}")
     print(f"Number of streams: {len(streams)}")
     
-    # Print stream details to help debug
+    # Debug: Stream details
     for idx, stream in enumerate(streams):
         stream_name = stream['info']['name'][0]
         stream_srate = stream['info']['effective_srate']
-        print(f"Stream {idx + 1}: {stream_name}")
+        stream_shape = np.array(stream['time_series']).shape
+        print(f"Stream {idx + 1} - Name: {stream_name}")
         print(f"Sampling rate: {stream_srate}")
-
-        if 'desc' in stream['info']:
-            desc = stream['info']['desc']
-            if desc and isinstance(desc, list) and len(desc) > 0:
-                if isinstance(desc[0], dict) and 'channels' in desc[0]:
-                    channels_info = desc[0]['channels']
-                    if channels_info and 'channel' in channels_info[0]:
-                        num_channels = len(channels_info[0]['channel'])
-                        print(f"Number of channels: {num_channels}")
-                    else:
-                        print(f"Stream {stream_name} has no 'channel' field in channels information.")
-                else:
-                    print(f"Stream {stream_name} has no 'channels' key or the structure is unexpected.")
-            else:
-                print(f"Stream {stream_name} has an empty or invalid 'desc'.")
-        else:
-            print(f"Stream {stream_name} has no 'desc' information.")
+        print(f"Time series shape: {stream_shape}")
+        print(f"First 10 timestamps: {stream['time_stamps'][:10]}")
+        print(f"First 10 data points: {np.array(stream['time_series'])[:10]}")
     
     return streams, header
 
@@ -50,7 +36,7 @@ def find_xdf_files(base_dir):
     return file_paths
 
 def process_all_xdf_files(base_dir, base_save_dir):
-    """Process all .xdf files in the LEFT and RIGHT directories by applying perform_ICA."""
+    """Process all .xdf files in the LEFT and RIGHT directories."""
     left_dir = os.path.join(base_dir, 'LEFT')
     right_dir = os.path.join(base_dir, 'RIGHT')
 
@@ -78,114 +64,106 @@ def process_all_xdf_files(base_dir, base_save_dir):
 
 def perform_ICA(streams, side_identifier, xdf_filename, base_save_dir, trim_samples=(0, 0)):
     """
-    Perform ICA on EEG data and save the ICA solution and filtered raw EEG data.
+    Perform ICA on EEG data, save the ICA solution, filtered raw EEG data, and ICA-applied data.
+    Also store specific data segments and event timestamps in a JSON file.
     """
-    print(f"Length of the streams list: {len(streams)}")
+    data, sampling_rate, timestamps, event_timestamps = None, None, None, []
 
-    data = None
-    sampling_rate = None
-    timestamps = None
-    event_timestamps = []
-
-    first_stream_data = np.array(streams[0]['time_series'])
-    second_stream_data = np.array(streams[1]['time_series']) if len(streams) > 1 else None
-
+    # Debug: Stream and EEG data details
+    for idx, stream in enumerate(streams):
+        stream_name = stream['info']['name'][0]
+        stream_data = np.array(stream['time_series'])
+        print(f"Stream {idx + 1} - {stream_name}")
+        print(f"Shape: {stream_data.shape}, Sampling rate: {stream['info']['effective_srate']}")
+    
+    # Extract EEG data (assumes it has 10 channels)
     for idx, stream in enumerate(streams):
         stream_data = np.array(stream['time_series'])
-        if stream_data.shape[1] == 10 and streams[idx]['info']['effective_srate'] > 0:
+        if stream_data.shape[1] == 10 and stream['info']['effective_srate'] > 0:
             data = stream_data
-            sampling_rate = streams[idx]['info']['effective_srate']
+            sampling_rate = stream['info']['effective_srate']
             timestamps = np.array(stream['time_stamps'])
-            print(f"Using stream {idx + 1} with shape: {data.shape}")
+            print(f"Using EEG data from stream {idx + 1} with shape: {data.shape}")
             break
     else:
         raise ValueError("No valid EEG data found in the streams.")
 
+    # Identify event timestamps (assuming single-channel stream indicates events)
     for idx, stream in enumerate(streams):
         stream_data = np.array(stream['time_series'])
-        if stream_data.shape[1] == 30 and stream_data.shape[0] == 1:
-            event_timestamps.extend(stream['time_stamps'])
-            print(f"Found event data in stream {idx + 1} with timestamps: {stream['time_stamps']}")
+        if stream_data.shape[1] == 1:
+            print(f"Checking stream {idx + 1} for event markers...")
+            for ts, value in zip(stream['time_stamps'], stream_data[:, 0]):
+                if value != 0:
+                    event_timestamps.append(ts)
+                    print(f"Event found at {ts} with marker value {value}")
 
-    if not isinstance(data, np.ndarray) or not np.issubdtype(data.dtype, np.number):
-        raise ValueError("No valid numeric data found in any of the streams.")
+    # Debug: Confirm extraction success
+    if data is None or timestamps is None:
+        raise ValueError("Failed to extract EEG data or timestamps.")
+    print(f"Event timestamps found: {event_timestamps}")
 
-    if trim_samples[0] > 0 or trim_samples[1] > 0:
-        trim_start = min(trim_samples[0], data.shape[0])
-        trim_end = min(trim_samples[1], data.shape[0])
-        data = data[trim_start:data.shape[0] - trim_end]
-        if timestamps is not None:
-            timestamps = timestamps[trim_start:len(timestamps) - trim_end]
-
+    # Prepare MNE Raw object
     ch_names = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4', 'GND']
     info = mne.create_info(ch_names=ch_names, sfreq=sampling_rate, ch_types='eeg')
     raw = mne.io.RawArray(data.T, info)
 
+    # Set montage for electrode layout
     montage = mne.channels.make_dig_montage({
-        'F3': (-39, 0.33333, 0), 
-        'Fz': (0, 0.25556, 0),
-        'F4': (39, 0.33333, 0),
-        'C3': (-90, 0.25556, 0),
-        'Cz': (0, 0, 0),
-        'C4': (90, 0.25556, 0),
-        'P3': (-141, 0.33333, 0),
-        'Pz': (180, 0.25556, 0),
-        'P4': (141, 0.33333, 0),
-        'GND': (0, -0.1, 0)
+        'F3': (-39, 0.33333, 0), 'Fz': (0, 0.25556, 0),
+        'F4': (39, 0.33333, 0), 'C3': (-90, 0.25556, 0),
+        'Cz': (0, 0, 0), 'C4': (90, 0.25556, 0),
+        'P3': (-141, 0.33333, 0), 'Pz': (180, 0.25556, 0),
+        'P4': (141, 0.33333, 0), 'GND': (0, -0.1, 0)
     })
     raw.set_montage(montage)
 
-    notch_freq = 50
+    # Apply filtering and ICA
     filtered_raw = raw.copy().filter(l_freq=1.0, h_freq=None)
-    filtered_raw.notch_filter(freqs=[notch_freq], method='iir')
+    filtered_raw.notch_filter(freqs=[50], method='iir')
 
     ica = mne.preprocessing.ICA(n_components=10, random_state=42, max_iter='auto')
     ica.fit(filtered_raw)
-    filtered_raw = ica.apply(filtered_raw)
+    filtered_ica_raw = filtered_raw.copy()
+    ica.apply(filtered_ica_raw)
 
-    subject_session = re.findall(r'ses-S\d+', xdf_filename)
-    if len(subject_session) > 0:
-        subject_session = subject_session[0]
-        subject_id = subject_session.split('-')[1]
+    # Output paths
+    subject_id = re.findall(r'ses-S\d+', xdf_filename)[0].split('-')[1].zfill(3)
+    side_folder = 'L' if side_identifier == 1 else 'R'
+    output_dir = os.path.join(base_save_dir, side_folder, f"{subject_id}")
+    os.makedirs(output_dir, exist_ok=True)
 
-        # Ensure the subject_id is formatted with leading zeros (e.g., '001' instead of '1')
-        subject_id = subject_id.zfill(3)  # To ensure we get '001', '002', ..., '010'
+    # Save raw, ICA, and filtered ICA data
+    raw.save(os.path.join(output_dir, f"sub-{subject_id}_L_eeg_raw.fif"), overwrite=True)
+    ica.save(os.path.join(output_dir, f"sub-{subject_id}_L_eeg_ica.fif"), overwrite=True)
+    filtered_ica_raw.save(os.path.join(output_dir, f"sub-{subject_id}_L_eeg_ica_filtered_raw.fif"), overwrite=True)
 
-        # Determine the directory based on side identifier
-        side_folder = 'L' if side_identifier == 1 else 'R'
-        
-        # Create the subject folder (e.g., 'S001', 'S002') inside the side folder
-        subject_folder = f"{subject_id}"
-        
-        # Create subject folder inside the side folder if it doesn't exist
-        output_dir = os.path.join(base_save_dir, side_folder, subject_folder)
-        os.makedirs(output_dir, exist_ok=True)
+    # Event data JSON
+    json_data = {"event_timestamps": event_timestamps, "data_segments": []}
+    
+    for event_time in event_timestamps:
+        event_index = np.searchsorted(timestamps, event_time)
+        if event_index < len(timestamps):
+            end_index_raw = min(event_index + int(0.2 * sampling_rate), data.shape[0])
+            end_index_ica = min(event_index + int(2 * sampling_rate), data.shape[0])
 
-        # Define filename prefix based on side identifier
-        if side_identifier == 1:
-            filename_prefix = f"sub-{subject_id}_L_eeg_ica"
+            raw_segment = data[event_index:end_index_raw]
+            ica_segment = filtered_ica_raw.get_data()[:, event_index:end_index_ica]
+
+            json_data["data_segments"].append({
+                "event_time": event_time,
+                "raw_segment": raw_segment.tolist(),
+                "ica_segment": ica_segment.tolist()
+            })
         else:
-            filename_prefix = f"sub-{subject_id}_R_eeg_raw"
+            print(f"Event index {event_index} out of bounds for event_time {event_time}")
 
+    json_path = os.path.join(output_dir, f"sub-{subject_id}_event_data.json")
+    with open(json_path, "w") as json_file:
+        json.dump(json_data, json_file, indent=4)
+        print(f"Event data and segments saved to: {json_path}")
 
-        # Create the full paths for saving the raw and ICA files
-        save_path_raw = os.path.join(output_dir, f"{filename_prefix}_raw.fif")
-        save_path_ica = os.path.join(output_dir, f"{filename_prefix}_ica.fif")
-
-        # Save files if they don't already exist
-        if not os.path.exists(save_path_raw):
-            filtered_raw.save(save_path_raw, overwrite=True)
-            print(f"Filtered raw data saved to: {save_path_raw}")
-        else:
-            print(f"File {save_path_raw} already exists. Skipping save.")
-
-        if not os.path.exists(save_path_ica):
-            ica.save(save_path_ica, overwrite=True)
-            print(f"ICA solution saved to: {save_path_ica}")
-        else:
-            print(f"File {save_path_ica} already exists. Skipping save.")
-
-    return filtered_raw, ica, timestamps, data, event_timestamps
+    return filtered_ica_raw, ica, timestamps, data, event_timestamps
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="XDF EEG File Processor")
