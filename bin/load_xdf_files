@@ -50,7 +50,9 @@ def process_all_xdf_files(base_dir, base_save_dir):
         print(f"Processing {left_file}...")
         streams_L, header_L = load_xdf_file(left_file)
         try:
-            EEG_DATA_L, ICA_L, timestamps_L, relevant_time_series_L, event_timestamps_L = perform_ICA(streams_L, 1, left_file, base_save_dir)
+            EEG_DATA_L, ICA_L, timestamps_L, relevant_time_series_L, event_timestamps_L = perform_ICA(
+                streams_L, 'L', left_file, base_save_dir
+            )
         except Exception as e:
             print(f"Error processing {left_file}: {e}")
 
@@ -58,24 +60,19 @@ def process_all_xdf_files(base_dir, base_save_dir):
         print(f"Processing {right_file}...")
         streams_R, header_R = load_xdf_file(right_file)
         try:
-            EEG_DATA_R, ICA_R, timestamps_R, relevant_time_series_R, event_timestamps_R = perform_ICA(streams_R, 2, right_file, base_save_dir)
+            EEG_DATA_R, ICA_R, timestamps_R, relevant_time_series_R, event_timestamps_R = perform_ICA(
+                streams_R, 'R', right_file, base_save_dir
+            )
         except Exception as e:
             print(f"Error processing {right_file}: {e}")
 
-def perform_ICA(streams, side_identifier, xdf_filename, base_save_dir, trim_samples=(0, 0)):
+def perform_ICA(streams, side_label, xdf_filename, base_save_dir, trim_samples=(0, 0)):
     """
     Perform ICA on EEG data, save the ICA solution, filtered raw EEG data, and ICA-applied data.
-    Also store specific data segments and event timestamps in a JSON file.
+    Store specific data segments (1 seconds after events) and event timestamps in a JSON file.
     """
     data, sampling_rate, timestamps, event_timestamps = None, None, None, []
 
-    # Debug: Stream and EEG data details
-    for idx, stream in enumerate(streams):
-        stream_name = stream['info']['name'][0]
-        stream_data = np.array(stream['time_series'])
-        print(f"Stream {idx + 1} - {stream_name}")
-        print(f"Shape: {stream_data.shape}, Sampling rate: {stream['info']['effective_srate']}")
-    
     # Extract EEG data (assumes it has 10 channels)
     for idx, stream in enumerate(streams):
         stream_data = np.array(stream['time_series'])
@@ -91,17 +88,12 @@ def perform_ICA(streams, side_identifier, xdf_filename, base_save_dir, trim_samp
     # Identify event timestamps (assuming single-channel stream indicates events)
     for idx, stream in enumerate(streams):
         stream_data = np.array(stream['time_series'])
-        if stream_data.shape[1] == 1:
+        if stream_data.shape[1] == 1:  # Check for single-channel stream (likely event markers)
             print(f"Checking stream {idx + 1} for event markers...")
             for ts, value in zip(stream['time_stamps'], stream_data[:, 0]):
-                if value != 0:
+                if value != 0:  # Assuming non-zero values are event markers
                     event_timestamps.append(ts)
                     print(f"Event found at {ts} with marker value {value}")
-
-    # Debug: Confirm extraction success
-    if data is None or timestamps is None:
-        raise ValueError("Failed to extract EEG data or timestamps.")
-    print(f"Event timestamps found: {event_timestamps}")
 
     # Prepare MNE Raw object
     ch_names = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4', 'GND']
@@ -129,41 +121,55 @@ def perform_ICA(streams, side_identifier, xdf_filename, base_save_dir, trim_samp
 
     # Output paths
     subject_id = re.findall(r'ses-S\d+', xdf_filename)[0].split('-')[1].zfill(3)
-    side_folder = 'L' if side_identifier == 1 else 'R'
-    output_dir = os.path.join(base_save_dir, side_folder, f"{subject_id}")
+    output_dir = os.path.join(base_save_dir, side_label, f"{subject_id}")
     os.makedirs(output_dir, exist_ok=True)
 
     # Save raw, ICA, and filtered ICA data
-    raw.save(os.path.join(output_dir, f"sub-{subject_id}_L_eeg_raw.fif"), overwrite=True)
-    ica.save(os.path.join(output_dir, f"sub-{subject_id}_L_eeg_ica.fif"), overwrite=True)
-    filtered_ica_raw.save(os.path.join(output_dir, f"sub-{subject_id}_L_eeg_ica_filtered_raw.fif"), overwrite=True)
+    raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_raw.fif"), overwrite=True)
+    ica.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_ica.fif"), overwrite=True)
+    filtered_ica_raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_ica_filtered_raw.fif"), overwrite=True)
 
-    # Event data JSON
-    json_data = {"event_timestamps": event_timestamps, "data_segments": []}
-    
+    # Event data JSON with side label and 2-second segments after each event
+    json_data = {
+        "side": side_label,
+        "event_timestamps": [float(ts) for ts in event_timestamps],
+        "data_segments": []
+    }
+
+    # Extract 2-second segments after each event timestamp
+    segment_duration_samples = int(1 * sampling_rate)  # Duration of 2 seconds in samples
+
+    # Retrieve the data from the filtered ICA raw object
+    filtered_ica_data = filtered_ica_raw.get_data()
+
     for event_time in event_timestamps:
+        # Find the index corresponding to the event_time
         event_index = np.searchsorted(timestamps, event_time)
-        if event_index < len(timestamps):
-            end_index_raw = min(event_index + int(0.2 * sampling_rate), data.shape[0])
-            end_index_ica = min(event_index + int(2 * sampling_rate), data.shape[0])
+        # Calculate the end index for a 2-second segment
+        end_index = min(event_index + segment_duration_samples, filtered_ica_data.shape[1])
 
-            raw_segment = data[event_index:end_index_raw]
-            ica_segment = filtered_ica_raw.get_data()[:, event_index:end_index_ica]
+        # Extract the segment of the data for this event
+        ica_segment = filtered_ica_data[:, event_index:end_index]
 
-            json_data["data_segments"].append({
-                "event_time": event_time,
-                "raw_segment": raw_segment.tolist(),
-                "ica_segment": ica_segment.tolist()
-            })
-        else:
-            print(f"Event index {event_index} out of bounds for event_time {event_time}")
+        # Store the event time and the corresponding segment
+        json_data["data_segments"].append({
+            "event_time": float(event_time),
+            "ica_segment": ica_segment.tolist()  # Convert to list for JSON serialization
+        })
 
-    json_path = os.path.join(output_dir, f"sub-{subject_id}_event_data.json")
+    json_path = os.path.join(output_dir, f"sub-{subject_id}_{side_label}_event_data.json")
     with open(json_path, "w") as json_file:
         json.dump(json_data, json_file, indent=4)
         print(f"Event data and segments saved to: {json_path}")
 
+    # Instead of JSON, store in a NumPy .npz file
+    npz_data_path = os.path.join(output_dir, f"sub-{subject_id}_{side_label}_event_data.npz")
+    np.savez(npz_data_path, event_timestamps=np.array(event_timestamps), data_segments=np.array(json_data["data_segments"]))
+    print(f"Event data and segments saved to: {npz_data_path}")
+
+
     return filtered_ica_raw, ica, timestamps, data, event_timestamps
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="XDF EEG File Processor")

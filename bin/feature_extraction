@@ -6,130 +6,166 @@ import pandas as pd
 import json
 import pickle
 
-def extract_features_from_events(raw, timestamps, window_duration=2.0, sfreq=250):
+def extract_features_from_events(raw, events, window_duration=2.0, sfreq=250):
     """
-    Extracts features from 2-second windows starting from each event timestamp.
-    
-    Parameters:
-        raw (mne.io.Raw): The raw EEG data.
-        timestamps (list of float): Event timestamps in seconds.
-        window_duration (float): Duration of the window after each event in seconds.
-        sfreq (float): Sampling frequency of the data.
-        
-    Returns:
-        list of dicts: List of feature dictionaries for each event.
+    Extracts features from a window around each event.
     """
     features_list = []
 
-    for timestamp in timestamps:
-        start_sample = int((timestamp) * sfreq)
-        end_sample = start_sample + int(window_duration * sfreq)
+    for idx, event in enumerate(events):
+        # Check if event is a dictionary or a plain timestamp
+        if isinstance(event, dict):
+            timestamp = event.get("event_time")
+        else:
+            timestamp = event  # Assume it's a plain timestamp if not a dictionary
 
-        if end_sample > raw.n_times:
-            print(f"Skipping event at {timestamp} as it exceeds data length.")
+        # Validate and convert timestamp to float
+        try:
+            timestamp = float(timestamp)
+        except (ValueError, TypeError):
+            print(f"[DEBUG] Invalid timestamp at index {idx}: {timestamp}. Skipping this event.")
             continue
 
+        # Calculate sample indices
+        start_sample = int(timestamp * sfreq)
+        end_sample = start_sample + int(window_duration * sfreq)
+
+        # Check if window fits within data length
+        if end_sample > raw.n_times:
+            print(f"[DEBUG] Skipping event at {timestamp} as it exceeds data length.")
+            continue
+
+        # Extract data window and calculate features
         data_window, _ = raw[:, start_sample:end_sample]
-        features = {}
-
-        # Calculate RMS for each channel
-        features['rms'] = np.sqrt(np.mean(data_window**2, axis=1))
-
-        # Peak-to-Peak Amplitude for each channel
-        features['ptp'] = np.ptp(data_window, axis=1)
+        features = {
+            'rms': np.sqrt(np.mean(data_window ** 2, axis=1)),
+            'ptp': np.ptp(data_window, axis=1)
+        }
 
         # Power Spectral Density in frequency bands (Delta, Theta, Alpha, Beta, Gamma)
-        psd, freqs = mne.time_frequency.psd_array_multitaper(data_window, sfreq, fmin=0.5, fmax=40, verbose=False)
-        
-        features['delta_power'] = psd[:, (freqs >= 0.5) & (freqs < 4)].mean(axis=1)
-        features['theta_power'] = psd[:, (freqs >= 4) & (freqs < 8)].mean(axis=1)
-        features['alpha_power'] = psd[:, (freqs >= 8) & (freqs < 13)].mean(axis=1)
-        features['beta_power'] = psd[:, (freqs >= 13) & (freqs < 30)].mean(axis=1)
-        features['gamma_power'] = psd[:, (freqs >= 30) & (freqs < 40)].mean(axis=1)
+        psd, freqs = mne.time_frequency.psd_array_multitaper(
+            data_window, sfreq, fmin=0.5, fmax=40, verbose=False
+        )
+        features.update({
+            'delta_power': psd[:, (freqs >= 0.5) & (freqs < 4)].mean(axis=1),
+            'theta_power': psd[:, (freqs >= 4) & (freqs < 8)].mean(axis=1),
+            'alpha_power': psd[:, (freqs >= 8) & (freqs < 13)].mean(axis=1),
+            'beta_power': psd[:, (freqs >= 13) & (freqs < 30)].mean(axis=1),
+            'gamma_power': psd[:, (freqs >= 30) & (freqs < 40)].mean(axis=1)
+        })
 
         features_list.append(features)
+
+        print(f"[DEBUG] Extracted features for event at {timestamp} (index {idx}).")
 
     return features_list
 
 def load_and_extract_features(base_dir, sfreq=250):
     """
-    Load .fif files and extract features around events for each subject,
+    Load .fif files and extract features from all events for each subject,
     storing them in a single dictionary separated by "Left" and "Right" trials.
-    
-    Parameters:
-        base_dir (str): Base directory containing LEFT and RIGHT processed files.
-        sfreq (float): Sampling frequency of the data.
-        
-    Returns:
-        dict: Dictionary with extracted features organized by trial side and subject ID.
     """
     left_dir = os.path.join(base_dir, 'L')
     right_dir = os.path.join(base_dir, 'R')
     all_features = {"Left": {}, "Right": {}}
 
     for side, side_dir in zip(["Left", "Right"], [left_dir, right_dir]):
+        print(f"[DEBUG] Processing side: {side}. Directory: {side_dir}")
+
         if not os.path.exists(side_dir):
-            print(f"Directory not found: {side_dir}")
+            print(f"[DEBUG] Directory not found: {side_dir}")
             continue
 
         for subject_folder in sorted(os.listdir(side_dir)):
             subject_path = os.path.join(side_dir, subject_folder)
 
             if not os.path.isdir(subject_path):
+                print(f"[DEBUG] Skipping non-directory: {subject_path}")
                 continue
 
+            print(f"[DEBUG] Processing subject folder: {subject_folder}")
+
+            # Search within subject folder for required files
             raw_file = None
-            events_file = None
-            for file in os.listdir(subject_path):
-                if file.endswith('_raw.fif'):
-                    raw_file = os.path.join(subject_path, file)
-                elif file.endswith('_events.json'):
-                    events_file = os.path.join(subject_path, file)
+            npz_file = None
+            # events_file = None  # JSON file handling (old way)
+            for root, _, files in os.walk(subject_path):
+                for file in files:
+                    if file.endswith('_raw.fif'):
+                        raw_file = os.path.join(root, file)
+                    elif file.endswith('_event_data.npz'):
+                        npz_file = os.path.join(root, file)
+                    # elif file.endswith('_event_data.json'):  # JSON file handling (old way)
+                    #     events_file = os.path.join(root, file)
 
-            if raw_file and events_file:
-                print(f"Loading raw file: {raw_file}")
-                raw = mne.io.read_raw_fif(raw_file, preload=True)
+            # Check if required files are found
+            if raw_file and npz_file:
+                print(f"[DEBUG] Loading raw file: {raw_file}")
+                try:
+                    raw = mne.io.read_raw_fif(raw_file, preload=True, verbose=False)
+                    print(f"[DEBUG] Raw data loaded successfully. Data points: {raw.n_times}, Channels: {raw.info['nchan']}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to load raw file: {raw_file}. Error: {e}")
+                    continue
 
-                # Load event timestamps from JSON
-                with open(events_file, 'r') as f:
-                    event_data = json.load(f)
-                event_timestamps = event_data.get("timestamps", [])
+                # Load event data from .npz file
+                try:
+                    npz_data = np.load(npz_file, allow_pickle=True)
+                    events_data = npz_data['event_timestamps']
+                    print(f"[DEBUG] Loaded events from {npz_file}. Total events: {len(events_data)}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to load event data: {npz_file}. Error: {e}")
+                    continue
 
-                # Extract features from the event timestamps
-                features = extract_features_from_events(raw, event_timestamps, sfreq=sfreq)
+                # Extract features from each event
+                features = extract_features_from_events(raw, events_data, sfreq=sfreq)
+                print(f"[DEBUG] Extracted {len(features)} feature sets for subject {subject_folder}")
 
                 # Add features to the dictionary
                 all_features[side][subject_folder] = features
             else:
-                print(f"Missing files for subject in {subject_path}")
+                print(f"[DEBUG] Missing files for subject in {subject_path}. raw_file: {raw_file}, npz_file: {npz_file}")
+                # print(f"[DEBUG] Missing files for subject in {subject_path}. raw_file: {raw_file}, events_file: {events_file}")  # JSON file handling (old way)
 
     return all_features
 
 def save_features_dict(features_dict, output_path, file_format="json"):
-    # Ensure `output_path` is a file path with a specified extension
-    if os.path.isdir(output_path):
-        output_path = os.path.join(output_path, "features_dictionary.json")
+    """
+    Save the features dictionary to a specified file format.
+    """
+    print(f"[DEBUG] Saving features to {output_path} as {file_format} format.")
 
-    with open(output_path, 'w') as f:
-        if file_format == "json":
-            json.dump(features_dict, f)
-        elif file_format == "csv":
-            # If CSV format, convert dict to DataFrame and save
+    # Ensure output path ends with appropriate file extension
+    if file_format == "json":
+        if not output_path.endswith(".json"):
+            output_path += ".json"
+        try:
+            with open(output_path, 'w') as f:
+                json.dump(features_dict, f, indent=4)
+            print(f"[DEBUG] Features saved successfully as JSON to {output_path}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save JSON file: {e}")
+    elif file_format == "csv":
+        try:
             features_df = pd.concat(
                 {k: pd.DataFrame(v) for k, v in features_dict.items()}, names=["trial", "feature"]
             )
-            features_df.to_csv(f)
-
+            features_df.to_csv(output_path)
+            print(f"[DEBUG] Features saved successfully as CSV to {output_path}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save CSV file: {e}")
+    else:
+        print(f"[ERROR] Unsupported file format: {file_format}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract features from .fif files based on event timestamps.")
     parser.add_argument('-f', '--base_dir', required=True, help='Base directory containing LEFT and RIGHT processed files.')
     parser.add_argument('-o', '--output_path', required=True, help='Output path for saving the extracted features dictionary.')
-    parser.add_argument('--file_format', choices=['json', 'pickle'], default='json', help="Format to save the features dictionary ('json' or 'pickle').")
+    parser.add_argument('--file_format', choices=['json', 'csv'], default='json', help="Format to save the features dictionary ('json' or 'csv').")
     args = parser.parse_args()
 
     # Extract features and store in a dictionary
-    features_dict = load_and_extract_features(args.base_dir)
+    features_dict = load_and_extract_features(args.base_dir, sfreq=250)
 
     # Save the dictionary to a file
     save_features_dict(features_dict, args.output_path, file_format=args.file_format)
