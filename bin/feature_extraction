@@ -5,6 +5,9 @@ import numpy as np
 import pandas as pd
 import json
 import matplotlib.pyplot as plt
+from scipy.stats import kurtosis, skew
+from antropy import entropy as ent
+from antropy import higuchi_fd
 
 def plot_eeg(raw, subject_folder, plot_dir):
     """ Plot raw EEG data and save the plot to the specified directory. """
@@ -15,17 +18,38 @@ def plot_eeg(raw, subject_folder, plot_dir):
     plt.close()
     print(f"[DEBUG] EEG plot saved to {plot_path}")
 
+def fractal_dimension_higuchi(signal, kmax=10):
+    """ Calculate the Higuchi fractal dimension of a signal. """
+    return higuchi_fd(signal, kmax)
+
+def hurst_exponent(signal):
+    """ Calculate the Hurst exponent of a signal. """
+    N = len(signal)
+    T = np.arange(1, N + 1)
+    Y = np.cumsum(signal - np.mean(signal))
+    R = np.max(Y) - np.min(Y)
+    S = np.std(signal)
+    return np.log(R / S) / np.log(N) if S != 0 else np.nan
+
+def fuzzy_entropy(signal, m=2, r=0.2):
+    """ Compute fuzzy entropy with a specified embedding dimension m and tolerance r. """
+    N = len(signal)
+    r *= np.std(signal)
+    def _phi(m):
+        X = np.array([signal[i: N - m + i + 1] for i in range(m)]).T
+        C = np.sum(np.exp(-(np.abs(X[:, None] - X[None, :]) ** 2).sum(axis=2) / (2 * r ** 2)), axis=0)
+        return C / (N - m + 1)
+    return -np.log(_phi(m + 1).mean() / _phi(m).mean())
+
 def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
     """ Extract features from each event and store them with separate rows for each channel. """
     features_list = []
     max_time = raw.n_times / sfreq
     print(f"[DEBUG] Data duration: {max_time}s, Sampling rate: {sfreq}Hz")
 
-    # Adjust timestamps to start from zero
     event_times_sec = events - events.min()
     print(f"Adjusted Event Times (in seconds): {event_times_sec}")
 
-    # Check for out-of-bounds events
     out_of_bounds_events = event_times_sec[(event_times_sec < 0) | (event_times_sec > max_time)]
     if len(out_of_bounds_events) > 0:
         print("Out of bounds events found:", out_of_bounds_events)
@@ -40,15 +64,17 @@ def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
         end_sample = start_sample + int(window_duration * sfreq)
         data_window, _ = raw[:, start_sample:end_sample]
 
-        # Calculate features for each channel separately
         for ch_idx, ch_data in enumerate(data_window):
             features = {
-                'channel': raw.ch_names[ch_idx],  # Channel name
+                'channel': raw.ch_names[ch_idx],
                 'rms': np.sqrt(np.mean(ch_data ** 2)),
-                'ptp': np.ptp(ch_data)
+                'ptp': np.ptp(ch_data),
+                'skewness': skew(ch_data),
+                'kurtosis': kurtosis(ch_data),
+                'hurst_exponent': hurst_exponent(ch_data),
+                'fractal_dimension': fractal_dimension_higuchi(ch_data)
             }
 
-            # Power spectral density and band-specific powers
             psd, freqs = mne.time_frequency.psd_array_multitaper(
                 ch_data[None, :], sfreq, fmin=0.5, fmax=40, verbose=False
             )
@@ -59,7 +85,19 @@ def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
                 'beta_power': psd[0, (freqs >= 13) & (freqs < 30)].mean(),
                 'gamma_power': psd[0, (freqs >= 30) & (freqs < 40)].mean()
             })
-            
+
+            try:
+                features.update({
+                    'sample_entropy': ent.sample_entropy(ch_data, 2, 0.2 * np.std(ch_data), metric='euclidean'),
+                    'fuzzy_entropy': fuzzy_entropy(ch_data, 2, 0.2),
+                    'tsallis_entropy': ent.tsallis_entropy(ch_data, 2),
+                    'improved_multiscale_permutation_entropy': ent.improved_multiscale_permutation_entropy(ch_data, metric='euclidean'),
+                    'multiscale_fuzzy_entropy': ent.multiscale_fuzzy_entropy(ch_data, 2, 0.2 * np.std(ch_data), metric='euclidean'),
+                    'refined_multiscale_fuzzy_entropy': ent.refined_multiscale_fuzzy_entropy(ch_data, 2, 0.2 * np.std(ch_data), metric='euclidean')
+                })
+            except Exception as e:
+                print(f"[WARNING] Entropy calculation error: {e}")
+
             features_list.append(features)
     
     return features_list
@@ -96,7 +134,6 @@ def load_and_extract_features(base_dir, plot_dir, sfreq=250):
                     npz_data = np.load(npz_file, allow_pickle=True)
                     events_data = np.array(npz_data['event_timestamps'], dtype=float)
                     
-                    # Extract features with each channel separately in its own row
                     features = extract_features_from_events(raw, events_data, window_duration=0.5, sfreq=sfreq)
                     for feat in features:
                         feat['side'] = side  # Add side info
@@ -108,7 +145,6 @@ def load_and_extract_features(base_dir, plot_dir, sfreq=250):
                 print(f"[DEBUG] Missing files for subject {subject_folder}.")
     
     return all_features
-
 
 def save_features(features, output_path, file_format="parquet"):
     """Save the extracted features to a specified format with a side column for left/right info."""
