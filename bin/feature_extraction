@@ -6,45 +6,50 @@ import pandas as pd
 import json
 import matplotlib.pyplot as plt
 
-def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
-    """ Extracts features from a window starting from each event timestamp, only if within data bounds. """
-    features_list = []
-    
-    # Calculate maximum timestamp that can be handled within the data length
-    max_time = raw.n_times / sfreq
-    print(f"[DEBUG] Data duration is {max_time} seconds with a sampling rate of {sfreq} Hz. Events beyond this will be skipped.")
-    
-    for idx, event in enumerate(events):
-        timestamp = float(event if isinstance(event, (float, int)) else event.get("event_time", 0))
-        #timestamp = float(event) / 1000 if isinstance(event, (float, int)) else float(event.get("event_time", 0)) / 1000
+def plot_eeg(raw, subject_folder, plot_dir):
+    """ Plot raw EEG data and save the plot to the specified directory. """
+    plt.figure(figsize=(10, 6))
+    raw.plot(scalings='auto', show=False, block=False)
+    plot_path = os.path.join(plot_dir, f"{subject_folder}_eeg_plot.png")
+    plt.savefig(plot_path)
+    plt.close()
+    print(f"[DEBUG] EEG plot saved to {plot_path}")
 
-        
-        
-        # Check if the timestamp is valid
-        if timestamp < 0:
-            print(f"[WARNING] Negative timestamp detected at event {idx}, skipping.")
-            continue
-        if timestamp + window_duration > max_time:
-            print(f"[DEBUG] Event at {timestamp} seconds exceeds data bounds, skipping.")
-            continue
-        
-        # Continue processing if timestamp is within bounds
+def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
+    """ Extract features from a window starting from each event timestamp, only if within data bounds. """
+    features_list = []
+    max_time = raw.n_times / sfreq
+    print(f"[DEBUG] Data duration: {max_time}s, Sampling rate: {sfreq}Hz")
+
+    # Adjust timestamps to start from zero
+    event_times_sec = events - events.min()
+    print(f"Adjusted Event Times (in seconds): {event_times_sec}")
+
+    # Check for out-of-bounds events
+    out_of_bounds_events = event_times_sec[(event_times_sec < 0) | (event_times_sec > max_time)]
+    if len(out_of_bounds_events) > 0:
+        print("Out of bounds events found:", out_of_bounds_events)
+    else:
+        print("All events are within the EEG data duration.")
+
+    for idx, timestamp in enumerate(event_times_sec):
+        if timestamp < 0 or timestamp + window_duration > max_time:
+            continue  # Skip out-of-bounds events
+
         start_sample = int(timestamp * sfreq)
         end_sample = start_sample + int(window_duration * sfreq)
-        
-        # Extract data for the window
         data_window, _ = raw[:, start_sample:end_sample]
-        
-        # Extract features
+
+        # Calculate various features
         features = {
             'rms': np.sqrt(np.mean(data_window ** 2, axis=1)),
             'ptp': np.ptp(data_window, axis=1)
         }
+
+        # Power spectral density and band-specific powers
         psd, freqs = mne.time_frequency.psd_array_multitaper(
             data_window, sfreq, fmin=0.5, fmax=40, verbose=False
         )
-        
-        # Frequency band power features
         features.update({
             'delta_power': psd[:, (freqs >= 0.5) & (freqs < 4)].mean(axis=1),
             'theta_power': psd[:, (freqs >= 4) & (freqs < 8)].mean(axis=1),
@@ -54,35 +59,26 @@ def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
         })
         
         features_list.append(features)
-        print(f"[DEBUG] Extracted features for event at {timestamp} (index {idx}).")
-    
-    if not features_list:
-        print(f"[WARNING] No features extracted: All events may be out of bounds for this file.")
     
     return features_list
 
-
-def load_and_extract_features(base_dir, output_dir, sfreq=250):
-    """ Load .fif files and extract features for all events for each subject, separated by "Left" and "Right" trials. """
+def load_and_extract_features(base_dir, plot_dir, sfreq=250):
+    """ Load .fif files and extract features, adding a 'side' label for each trial. """
     left_dir = os.path.join(base_dir, 'L')
     right_dir = os.path.join(base_dir, 'R')
-    all_features = {"Left": {}, "Right": {}}
-    
-    for side, side_dir in zip(["Left", "Right"], [left_dir, right_dir]):
-        print(f"[DEBUG] Processing side: {side}. Directory: {side_dir}")
+    all_features = []
+
+    for side, side_dir in zip(["left", "right"], [left_dir, right_dir]):
         if not os.path.exists(side_dir):
-            print(f"[DEBUG] Directory not found: {side_dir}")
+            print(f"[ERROR] Directory not found: {side_dir}")
             continue
         
         for subject_folder in sorted(os.listdir(side_dir)):
             subject_path = os.path.join(side_dir, subject_folder)
             if not os.path.isdir(subject_path):
-                print(f"[DEBUG] Skipping non-directory: {subject_path}")
-                continue
+                continue  # Skip non-directory items
             
-            print(f"[DEBUG] Processing subject folder: {subject_folder}")
             raw_file, npz_file = None, None
-            
             for root, _, files in os.walk(subject_path):
                 for file in files:
                     if file.endswith('_raw.fif'):
@@ -91,115 +87,54 @@ def load_and_extract_features(base_dir, output_dir, sfreq=250):
                         npz_file = os.path.join(root, file)
             
             if raw_file and npz_file:
-                print(f"[DEBUG] Loading raw file: {raw_file}")
                 try:
                     raw = mne.io.read_raw_fif(raw_file, preload=True, verbose=False)
-                    print(f"[DEBUG] Raw data loaded successfully. Data points: {raw.n_times}, Channels: {raw.info['nchan']}")
-                except Exception as e:
-                    print(f"[ERROR] Failed to load raw file: {raw_file}. Error: {e}")
-                    continue
-                
-                try:
+                    plot_eeg(raw, subject_folder, plot_dir)  # Plot EEG data
+
                     npz_data = np.load(npz_file, allow_pickle=True)
-                    events_data = npz_data['event_timestamps']
-                    # Ensure that event timestamps are numeric
-                    events_data = [float(event) if not isinstance(event, (float, int)) else event for event in events_data]
-                    print(f"[DEBUG] Loaded events from {npz_file}. Total events: {len(events_data)}")
+                    events_data = np.array(npz_data['event_timestamps'], dtype=float)
+                    
+                    features = extract_features_from_events(raw, events_data, window_duration=0.5, sfreq=sfreq)
+                    for feat in features:
+                        feat['side'] = side  # Add side info
+                        feat['subject'] = subject_folder  # Track subject
+                        all_features.append(feat)
                 except Exception as e:
-                    print(f"[ERROR] Failed to load event data: {npz_file}. Error: {e}")
-                    continue
-                
-                # Check if event timestamps are within bounds
-                max_time = raw.n_times / sfreq
-                valid_events = [
-                    event for event in events_data 
-                    if 0 <= event <= max_time - 1.5  # Ensure event is within bounds considering window duration
-                ]
-                print(f"[DEBUG] Valid events: {len(valid_events)} out of {len(events_data)} total events.")
-                
-                # Extract features for valid events
-                features = extract_features_from_events(raw, valid_events, window_duration=1.5, sfreq=sfreq)
-                print(f"[DEBUG] Extracted {len(features)} feature sets for subject {subject_folder}")
-                
-                all_features[side][subject_folder] = features
+                    print(f"[ERROR] Error processing subject {subject_folder}: {e}")
             else:
-                print(f"[DEBUG] Missing files for subject in {subject_path}. raw_file: {raw_file}, npz_file: {npz_file}")
+                print(f"[DEBUG] Missing files for subject {subject_folder}.")
     
     return all_features
 
-
-def save_ica_plots(raw, subject_folder, side, output_dir):
-    """
-    Visualize and save ICA component plots for each subject.
-    """
-    print(f"[DEBUG] Visualizing and saving plots for {subject_folder} on side {side}.")
-    # Set up plot directory
-    plot_dir = os.path.join(output_dir, side, subject_folder)
-    os.makedirs(plot_dir, exist_ok=True)
-
-    # Plot power spectral density (PSD) and save
-    psd_plot_path = os.path.join(plot_dir, f"{subject_folder}_psd.png")
-    fig_psd = raw.compute_psd().plot(show=False)  # Updated for newer MNE version
-    fig_psd.savefig(psd_plot_path)
-    plt.close(fig_psd)
-    print(f"[DEBUG] PSD plot saved at {psd_plot_path}")
-
-    # Manually plot time series data and save with matplotlib
-    time_series_plot_path = os.path.join(plot_dir, f"{subject_folder}_timeseries.png")
-    data, times = raw[:, :int(10 * raw.info['sfreq'])]  # First 10 seconds of data
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    for i in range(data.shape[0]):
-        ax.plot(times, data[i] + i * 10e-6, label=f"Channel {i + 1}")  # Offset for visibility
-
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Amplitude (uV)")
-    ax.set_title("EEG Time Series (First 10 Seconds)")
-    ax.legend()
-    fig.savefig(time_series_plot_path)
-    plt.close(fig)
-    print(f"[DEBUG] Time series plot saved at {time_series_plot_path}")
-
-
-def save_features_dict(features_dict, output_path, file_format="json"):
-    """
-    Save the features dictionary to a specified file format.
-    """
+def save_features(features, output_path, file_format="parquet"):
+    """Save the extracted features to a specified format with a side column for left/right info."""
     print(f"[DEBUG] Saving features to {output_path} as {file_format} format.")
-
-    # Ensure output path ends with appropriate file extension
-    if file_format == "json":
+    features_df = pd.DataFrame(features)
+    
+    if file_format == "parquet":
+        if not output_path.endswith(".parquet"):
+            output_path += ".parquet"
+        features_df.to_parquet(output_path)
+    elif file_format == "csv":
+        if not output_path.endswith(".csv"):
+            output_path += ".csv"
+        features_df.to_csv(output_path, index=False)
+    elif file_format == "json":
         if not output_path.endswith(".json"):
             output_path += ".json"
-        try:
-            with open(output_path, 'w') as f:
-                json.dump(features_dict, f, indent=4)
-            print(f"[DEBUG] Features saved successfully as JSON to {output_path}")
-        except Exception as e:
-            print(f"[ERROR] Failed to save JSON file: {e}")
-    elif file_format == "csv":
-        try:
-            features_df = pd.concat(
-                {k: pd.DataFrame(v) for k, v in features_dict.items()}, names=["trial", "feature"]
-            )
-            features_df.to_csv(output_path)
-            print(f"[DEBUG] Features saved successfully as CSV to {output_path}")
-        except Exception as e:
-            print(f"[ERROR] Failed to save CSV file: {e}")
-    else:
-        print(f"[ERROR] Unsupported file format: {file_format}")
-
+        features_df.to_json(output_path, orient='records')
+    print(f"[DEBUG] Features saved successfully in {file_format} format at {output_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract features from .fif files based on event timestamps.")
     parser.add_argument('-f', '--base_dir', required=True, help='Base directory containing LEFT and RIGHT processed files.')
-    parser.add_argument('-o', '--output_path', required=True, help='Output path for saving the extracted features dictionary.')
-    parser.add_argument('--file_format', choices=['json', 'csv'], default='json', help="Format to save the features dictionary ('json' or 'csv').")
+    parser.add_argument('-o', '--output_path', required=True, help='Output path for saving the extracted features.')
+    parser.add_argument('--file_format', choices=['json', 'csv', 'parquet'], default='parquet', help="Output format for the features.")
     parser.add_argument('-p', '--plot_dir', required=True, help='Directory to save plots of .fif files.')
     args = parser.parse_args()
 
-    # Extract features and store in a dictionary
-    features_dict = load_and_extract_features(args.base_dir, args.plot_dir, sfreq=250)
+    # Extract features and store them in a list of dictionaries
+    features = load_and_extract_features(args.base_dir, args.plot_dir, sfreq=250)
 
-    # Save the dictionary to a file
-    save_features_dict(features_dict, args.output_path, file_format=args.file_format)
+    # Save the features
+    save_features(features, args.output_path, file_format=args.file_format)
