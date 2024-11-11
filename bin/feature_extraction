@@ -16,7 +16,7 @@ def plot_eeg(raw, subject_folder, plot_dir):
     print(f"[DEBUG] EEG plot saved to {plot_path}")
 
 def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
-    """ Extract features from a window starting from each event timestamp, only if within data bounds. """
+    """ Extract features from each event and store them with separate rows for each channel. """
     features_list = []
     max_time = raw.n_times / sfreq
     print(f"[DEBUG] Data duration: {max_time}s, Sampling rate: {sfreq}Hz")
@@ -40,30 +40,32 @@ def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
         end_sample = start_sample + int(window_duration * sfreq)
         data_window, _ = raw[:, start_sample:end_sample]
 
-        # Calculate various features
-        features = {
-            'rms': np.sqrt(np.mean(data_window ** 2, axis=1)),
-            'ptp': np.ptp(data_window, axis=1)
-        }
+        # Calculate features for each channel separately
+        for ch_idx, ch_data in enumerate(data_window):
+            features = {
+                'channel': raw.ch_names[ch_idx],  # Channel name
+                'rms': np.sqrt(np.mean(ch_data ** 2)),
+                'ptp': np.ptp(ch_data)
+            }
 
-        # Power spectral density and band-specific powers
-        psd, freqs = mne.time_frequency.psd_array_multitaper(
-            data_window, sfreq, fmin=0.5, fmax=40, verbose=False
-        )
-        features.update({
-            'delta_power': psd[:, (freqs >= 0.5) & (freqs < 4)].mean(axis=1),
-            'theta_power': psd[:, (freqs >= 4) & (freqs < 8)].mean(axis=1),
-            'alpha_power': psd[:, (freqs >= 8) & (freqs < 13)].mean(axis=1),
-            'beta_power': psd[:, (freqs >= 13) & (freqs < 30)].mean(axis=1),
-            'gamma_power': psd[:, (freqs >= 30) & (freqs < 40)].mean(axis=1)
-        })
-        
-        features_list.append(features)
+            # Power spectral density and band-specific powers
+            psd, freqs = mne.time_frequency.psd_array_multitaper(
+                ch_data[None, :], sfreq, fmin=0.5, fmax=40, verbose=False
+            )
+            features.update({
+                'delta_power': psd[0, (freqs >= 0.5) & (freqs < 4)].mean(),
+                'theta_power': psd[0, (freqs >= 4) & (freqs < 8)].mean(),
+                'alpha_power': psd[0, (freqs >= 8) & (freqs < 13)].mean(),
+                'beta_power': psd[0, (freqs >= 13) & (freqs < 30)].mean(),
+                'gamma_power': psd[0, (freqs >= 30) & (freqs < 40)].mean()
+            })
+            
+            features_list.append(features)
     
     return features_list
 
 def load_and_extract_features(base_dir, plot_dir, sfreq=250):
-    """ Load .fif files and extract features, adding a 'side' label for each trial. """
+    """ Load .fif files and extract features, adding 'side' and 'channel' for each trial. """
     left_dir = os.path.join(base_dir, 'L')
     right_dir = os.path.join(base_dir, 'R')
     all_features = []
@@ -94,6 +96,7 @@ def load_and_extract_features(base_dir, plot_dir, sfreq=250):
                     npz_data = np.load(npz_file, allow_pickle=True)
                     events_data = np.array(npz_data['event_timestamps'], dtype=float)
                     
+                    # Extract features with each channel separately in its own row
                     features = extract_features_from_events(raw, events_data, window_duration=0.5, sfreq=sfreq)
                     for feat in features:
                         feat['side'] = side  # Add side info
@@ -105,6 +108,7 @@ def load_and_extract_features(base_dir, plot_dir, sfreq=250):
                 print(f"[DEBUG] Missing files for subject {subject_folder}.")
     
     return all_features
+
 
 def save_features(features, output_path, file_format="parquet"):
     """Save the extracted features to a specified format with a side column for left/right info."""
