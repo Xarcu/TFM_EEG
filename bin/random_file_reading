@@ -1,0 +1,165 @@
+import argparse
+import numpy as np
+import mne
+from scipy.signal import butter, filtfilt, iirnotch, detrend
+import pyxdf
+import os
+import re
+import json
+
+def load_xdf_file(filepath):
+    """Load the XDF file using pyxdf and log details about each stream."""
+    streams, header = pyxdf.load_xdf(filepath)
+    print(f"Loaded XDF file: {filepath}")
+    print(f"Number of streams: {len(streams)}")
+    
+    for idx, stream in enumerate(streams):
+        stream_name = stream['info']['name'][0]
+        stream_srate = stream['info']['effective_srate']
+        stream_shape = np.array(stream['time_series']).shape
+        print(f"Stream {idx + 1} - Name: {stream_name}")
+        print(f"Sampling rate: {stream_srate}")
+        print(f"Time series shape: {stream_shape}")
+        print(f"First 10 timestamps: {stream['time_stamps'][:10]}")
+        print(f"First 10 data points: {np.array(stream['time_series'])[:10]}")
+        
+    return streams, header
+
+
+def find_xdf_files(base_dir):
+    """Find all .xdf files within the given directory and its subdirectories."""
+    file_paths = []
+    for root, dirs, files in os.walk(base_dir):
+        for file in files:
+            if file.endswith(".xdf"):
+                file_paths.append(os.path.join(root, file))
+    return file_paths
+
+def process_combined_xdf_files(base_dir, base_save_dir):
+    """Process all .xdf files in the combined dataset."""
+    all_files = find_xdf_files(base_dir)
+
+    print(f"Found {len(all_files)} files in the dataset.")
+
+    for file_path in all_files:
+        print(f"Processing {file_path}...")
+        streams, header = load_xdf_file(file_path)
+        try:
+            filtered_raw_L, event_timestamps_L, event_data_segments_L = perform_ICA(
+                streams, 'L', file_path, base_save_dir, marker='n'
+            )
+            filtered_raw_R, event_timestamps_R, event_data_segments_R = perform_ICA(
+                streams, 'R', file_path, base_save_dir, marker='p'
+            )
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+
+
+def perform_ICA(streams, side_label, xdf_filename, base_save_dir, marker, trim_samples=(0, 0)):
+    """
+    Perform ICA on EEG data, save the ICA solution, filtered raw EEG data, and ICA-applied data.
+    Store specific data segments (1.5 seconds after events) and event timestamps in a JSON or NPZ file.
+    """
+    data, sampling_rate, timestamps, event_timestamps = None, None, None, []
+
+    # Extract EEG data (assumes it has 10 channels)
+    for idx, stream in enumerate(streams):
+        stream_data = np.array(stream['time_series'])
+        if stream_data.shape[1] == 10 and stream['info']['effective_srate'] > 0:
+            data = stream_data
+            sampling_rate = stream['info']['effective_srate']
+            timestamps = np.array(stream['time_stamps'])
+            print(f"Using EEG data from stream {idx + 1} with shape: {data.shape}")
+            print(f"Initial data values (first 10 points): {data[:10]}")
+            break
+    else:
+        raise ValueError("No valid EEG data found in the streams.")
+
+    print(f"Data statistics before processing - min: {np.min(data)}, max: {np.max(data)}, mean: {np.mean(data)}")
+
+    # Identify event timestamps (assuming single-channel stream indicates events)
+    for idx, stream in enumerate(streams):
+        stream_data = np.array(stream['time_series'])
+        if stream_data.shape[1] == 1:
+            print(f"Checking stream {idx + 1} for event markers...")
+            for ts, value in zip(stream['time_stamps'], stream_data[:, 0]):
+                if value == marker:  # Check if the event marker matches the side ('p' or 'n')
+                    event_timestamps.append(ts)
+                    print(f"Event found at {ts} with marker value {value}")
+
+    # Validate event timestamps to ensure they're within bounds of EEG data timestamps
+    event_timestamps_in_bounds = []
+    for event_time in event_timestamps:
+        if timestamps[0] <= event_time <= timestamps[-1]:  # Check bounds
+            event_timestamps_in_bounds.append(event_time)
+        else:
+            print(f"[WARNING] Event at {event_time} is out of bounds and will be ignored.")
+    
+    # Update event_timestamps with validated list
+    event_timestamps = event_timestamps_in_bounds
+
+    # Create MNE info and Raw object for EEG data
+    ch_names = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4', 'GND']
+    info = mne.create_info(ch_names=ch_names, sfreq=sampling_rate, ch_types='eeg')
+    raw = mne.io.RawArray(data.T, info)
+
+    # Apply montage for electrode layout
+    montage = mne.channels.make_dig_montage({
+        'F3': (-39, 0.33333, 0), 'Fz': (0, 0.25556, 0),
+        'F4': (39, 0.33333, 0), 'C3': (-90, 0.25556, 0),
+        'Cz': (0, 0, 0), 'C4': (90, 0.25556, 0),
+        'P3': (-141, 0.33333, 0), 'Pz': (180, 0.25556, 0),
+        'P4': (141, 0.33333, 0), 'GND': (0, -0.1, 0)
+    })
+    raw.set_montage(montage)
+
+    # Filter the data
+    filtered_raw = raw.copy().filter(l_freq=0.3, h_freq=30)
+    filtered_raw.notch_filter(freqs=[50], method='iir')
+
+    # Save the raw and filtered EEG data to FIF
+    subject_id = re.findall(r'ses-S\d+', xdf_filename)[0].split('-')[1].zfill(3)
+    output_dir = os.path.join(base_save_dir, side_label, f"{subject_id}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_raw.fif"), overwrite=True)
+    filtered_raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_ica_filtered_raw.fif"), overwrite=True)
+
+    # Extract and store 1.5 second windows around each event
+    segment_duration_samples = int(1.5 * sampling_rate)
+    event_data_segments = []
+
+    for event_time in event_timestamps:
+        event_index = np.searchsorted(timestamps, event_time)
+        end_index = min(event_index + segment_duration_samples, len(timestamps))
+        eeg_segment = data[event_index:end_index, :]
+
+        # Append segment data to list
+        event_data_segments.append({
+            'event_time': event_time,
+            'segment': eeg_segment.tolist()
+        })
+
+    # Save all event-related data to JSON or NPZ format
+    json_path = os.path.join(output_dir, f"sub-{subject_id}_{side_label}_event_data.json")
+    with open(json_path, "w") as json_file:
+        json.dump({
+            "side": side_label,
+            "event_timestamps": event_timestamps,
+            "event_data_segments": event_data_segments
+        }, json_file, indent=4)
+
+    # Optionally save as NPZ file
+    npz_data_path = os.path.join(output_dir, f"sub-{subject_id}_{side_label}_event_data.npz")
+    np.savez(npz_data_path, event_timestamps=np.array(event_timestamps), data_segments=np.array(event_data_segments))
+
+    return filtered_raw, event_timestamps, event_data_segments
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="XDF EEG File Processor (Combined LEFT/RIGHT)")
+    parser.add_argument('-b', '--base_dir', required=True, help='Base directory containing combined dataset with .xdf files.')
+    parser.add_argument('-o', '--output_dir', required=True, help='Output directory to save processed files.')
+    args = parser.parse_args()
+
+    process_combined_xdf_files(args.base_dir, args.output_dir)

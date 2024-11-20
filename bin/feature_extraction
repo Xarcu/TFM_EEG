@@ -256,8 +256,14 @@ def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
                 'skewness': skew(ch_data),
                 'kurtosis': kurtosis(ch_data),
                 'hurst_exponent': hurst_exponent(ch_data),
-                'fractal_dimension': fractal_dimension_higuchi(ch_data)
             }
+
+            try:
+                # Higuchi fractal dimension
+                features['fractal_dimension'] = fractal_dimension_higuchi(ch_data)
+            except Exception as e:
+                print(f"[WARNING] Higuchi fractal dimension error: {e}")
+                features['fractal_dimension'] = np.nan
 
             psd, freqs = mne.time_frequency.psd_array_multitaper(
                 ch_data[None, :], sfreq, fmin=0.5, fmax=40, verbose=False
@@ -270,7 +276,6 @@ def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
                 'gamma_power': psd[0, (freqs >= 30) & (freqs < 40)].mean()
             })
 
-            # Alternative entropy calculations
             try:
                 features.update({
                     'sample_entropy': samp_entropy(ch_data, 2, 0.2 * np.std(ch_data)),
@@ -281,14 +286,15 @@ def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
                 hist, bin_edges = np.histogram(ch_data, bins=50, density=True)
                 features['shannon_entropy'] = entropy(hist)
 
-                # Lempel-Ziv Complexity (custom implementation)
+                # Lempel-Ziv Complexity
                 features['lziv_complexity'] = lempel_ziv_complexity(ch_data)
             except Exception as e:
                 print(f"[WARNING] Entropy calculation error: {e}")
 
             features_list.append(features)
-    
+
     return features_list
+
 
 def load_and_extract_features(base_dir, plot_dir, sfreq=250):
     """ Load .fif files and extract features, adding 'side' and 'channel' for each trial. """

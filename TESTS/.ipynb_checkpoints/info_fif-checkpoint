@@ -1,0 +1,55 @@
+# Inspecting the Contents of a FIF File
+
+## Overview
+
+The `.fif` files used in MNE-Python store EEG and MEG data along with metadata. To understand what is contained in a `.fif` file, you can load the file using MNE-Python and print various attributes. This includes channel names, data shape, sampling frequency, and more.
+
+## Inspecting a FIF File
+
+You can use the following script to inspect the contents of a `.fif` file:
+
+```python
+import os
+import mne
+
+def inspect_fif_file(file_path):
+    """Inspect the contents of the given .fif file."""
+    if not os.path.exists(file_path):
+        print(f"File not found: {file_path}")
+        return
+
+    print(f"Loading raw file: {file_path}")
+    raw = mne.io.read_raw_fif(file_path, preload=True)
+
+    # Print basic information
+    print("=== Basic Info ===")
+    print(raw.info)
+
+    # Print data shape
+    print(f"Data shape: {raw.get_data().shape}")
+
+    # Print channel names
+    print("Channel names:")
+    print(raw.ch_names)
+
+    # Print sampling frequency
+    print(f"Sampling frequency: {raw.info['sfreq']} Hz")
+
+    # Print number of channels
+    print(f"Number of channels: {raw.info['nchan']}")
+
+    # Print the first few timestamps
+    print("First few timestamps:")
+    print(raw.times[:5])
+
+    # Check for bad channels
+    if raw.info['bads']:
+        print("Bad channels found:")
+        print(raw.info['bads'])
+    else:
+        print("No bad channels.")
+
+if __name__ == "__main__":
+    # Replace this with your .fif file path
+    file_path = "path/to/your/file.fif"
+    inspect_fif_file(file_path)
