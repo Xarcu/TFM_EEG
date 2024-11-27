@@ -1,0 +1,576 @@
+#FEATURE EXTRACTION 
+
+# import os
+# import argparse
+# import mne
+# import numpy as np
+# import pandas as pd
+# import json
+# import matplotlib.pyplot as plt
+# from scipy.stats import kurtosis, skew
+# from antropy import entropy as ent
+# from antropy import higuchi_fd
+
+# def plot_eeg(raw, subject_folder, plot_dir):
+#     """ Plot raw EEG data and save the plot to the specified directory. """
+#     plt.figure(figsize=(10, 6))
+#     raw.plot(scalings='auto', show=False, block=False)
+#     plot_path = os.path.join(plot_dir, f"{subject_folder}_eeg_plot.png")
+#     plt.savefig(plot_path)
+#     plt.close()
+#     print(f"[DEBUG] EEG plot saved to {plot_path}")
+
+# def fractal_dimension_higuchi(signal, kmax=10):
+#     """ Calculate the Higuchi fractal dimension of a signal. """
+#     return higuchi_fd(signal, kmax)
+
+# def hurst_exponent(signal):
+#     """ Calculate the Hurst exponent of a signal. """
+#     N = len(signal)
+#     T = np.arange(1, N + 1)
+#     Y = np.cumsum(signal - np.mean(signal))
+#     R = np.max(Y) - np.min(Y)
+#     S = np.std(signal)
+#     return np.log(R / S) / np.log(N) if S != 0 else np.nan
+
+# def fuzzy_entropy(signal, m=2, r=0.2):
+#     """ Compute fuzzy entropy with a specified embedding dimension m and tolerance r. """
+#     N = len(signal)
+#     r *= np.std(signal)
+#     def _phi(m):
+#         X = np.array([signal[i: N - m + i + 1] for i in range(m)]).T
+#         C = np.sum(np.exp(-(np.abs(X[:, None] - X[None, :]) ** 2).sum(axis=2) / (2 * r ** 2)), axis=0)
+#         return C / (N - m + 1)
+#     return -np.log(_phi(m + 1).mean() / _phi(m).mean())
+
+# def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
+#     """ Extract features from each event and store them with separate rows for each channel. """
+#     features_list = []
+#     max_time = raw.n_times / sfreq
+#     print(f"[DEBUG] Data duration: {max_time}s, Sampling rate: {sfreq}Hz")
+
+#     event_times_sec = events - events.min()
+#     print(f"Adjusted Event Times (in seconds): {event_times_sec}")
+
+#     out_of_bounds_events = event_times_sec[(event_times_sec < 0) | (event_times_sec > max_time)]
+#     if len(out_of_bounds_events) > 0:
+#         print("Out of bounds events found:", out_of_bounds_events)
+#     else:
+#         print("All events are within the EEG data duration.")
+
+#     for idx, timestamp in enumerate(event_times_sec):
+#         if timestamp < 0 or timestamp + window_duration > max_time:
+#             continue  # Skip out-of-bounds events
+
+#         start_sample = int(timestamp * sfreq)
+#         end_sample = start_sample + int(window_duration * sfreq)
+#         data_window, _ = raw[:, start_sample:end_sample]
+
+#         for ch_idx, ch_data in enumerate(data_window):
+#             features = {
+#                 'channel': raw.ch_names[ch_idx],
+#                 'rms': np.sqrt(np.mean(ch_data ** 2)),
+#                 'ptp': np.ptp(ch_data),
+#                 'skewness': skew(ch_data),
+#                 'kurtosis': kurtosis(ch_data),
+#                 'hurst_exponent': hurst_exponent(ch_data),
+#                 'fractal_dimension': fractal_dimension_higuchi(ch_data)
+#             }
+
+#             psd, freqs = mne.time_frequency.psd_array_multitaper(
+#                 ch_data[None, :], sfreq, fmin=0.5, fmax=40, verbose=False
+#             )
+#             features.update({
+#                 'delta_power': psd[0, (freqs >= 0.5) & (freqs < 4)].mean(),
+#                 'theta_power': psd[0, (freqs >= 4) & (freqs < 8)].mean(),
+#                 'alpha_power': psd[0, (freqs >= 8) & (freqs < 13)].mean(),
+#                 'beta_power': psd[0, (freqs >= 13) & (freqs < 30)].mean(),
+#                 'gamma_power': psd[0, (freqs >= 30) & (freqs < 40)].mean()
+#             })
+
+#             try:
+#                 features.update({
+#                     'sample_entropy': ent.sample_entropy(ch_data, 2, 0.2 * np.std(ch_data), metric='euclidean'),
+#                     'fuzzy_entropy': fuzzy_entropy(ch_data, 2, 0.2),
+#                     'tsallis_entropy': ent.tsallis_entropy(ch_data, 2),
+#                     'improved_multiscale_permutation_entropy': ent.improved_multiscale_permutation_entropy(ch_data, metric='euclidean'),
+#                     'multiscale_fuzzy_entropy': ent.multiscale_fuzzy_entropy(ch_data, 2, 0.2 * np.std(ch_data), metric='euclidean'),
+#                     'refined_multiscale_fuzzy_entropy': ent.refined_multiscale_fuzzy_entropy(ch_data, 2, 0.2 * np.std(ch_data), metric='euclidean')
+#                 })
+#             except Exception as e:
+#                 print(f"[WARNING] Entropy calculation error: {e}")
+
+#             features_list.append(features)
+    
+#     return features_list
+
+# def load_and_extract_features(base_dir, plot_dir, sfreq=250):
+#     """ Load .fif files and extract features, adding 'side' and 'channel' for each trial. """
+#     left_dir = os.path.join(base_dir, 'L')
+#     right_dir = os.path.join(base_dir, 'R')
+#     all_features = []
+
+#     for side, side_dir in zip(["left", "right"], [left_dir, right_dir]):
+#         if not os.path.exists(side_dir):
+#             print(f"[ERROR] Directory not found: {side_dir}")
+#             continue
+        
+#         for subject_folder in sorted(os.listdir(side_dir)):
+#             subject_path = os.path.join(side_dir, subject_folder)
+#             if not os.path.isdir(subject_path):
+#                 continue  # Skip non-directory items
+            
+#             raw_file, npz_file = None, None
+#             for root, _, files in os.walk(subject_path):
+#                 for file in files:
+#                     if file.endswith('_raw.fif'):
+#                         raw_file = os.path.join(root, file)
+#                     elif file.endswith('_event_data.npz'):
+#                         npz_file = os.path.join(root, file)
+            
+#             if raw_file and npz_file:
+#                 try:
+#                     raw = mne.io.read_raw_fif(raw_file, preload=True, verbose=False)
+#                     plot_eeg(raw, subject_folder, plot_dir)  # Plot EEG data
+
+#                     npz_data = np.load(npz_file, allow_pickle=True)
+#                     events_data = np.array(npz_data['event_timestamps'], dtype=float)
+                    
+#                     features = extract_features_from_events(raw, events_data, window_duration=0.5, sfreq=sfreq)
+#                     for feat in features:
+#                         feat['side'] = side  # Add side info
+#                         feat['subject'] = subject_folder  # Track subject
+#                         all_features.append(feat)
+#                 except Exception as e:
+#                     print(f"[ERROR] Error processing subject {subject_folder}: {e}")
+#             else:
+#                 print(f"[DEBUG] Missing files for subject {subject_folder}.")
+    
+#     return all_features
+
+# def save_features(features, output_path, file_format="parquet"):
+#     """Save the extracted features to a specified format with a side column for left/right info."""
+#     print(f"[DEBUG] Saving features to {output_path} as {file_format} format.")
+#     features_df = pd.DataFrame(features)
+    
+#     if file_format == "parquet":
+#         if not output_path.endswith(".parquet"):
+#             output_path += ".parquet"
+#         features_df.to_parquet(output_path)
+#     elif file_format == "csv":
+#         if not output_path.endswith(".csv"):
+#             output_path += ".csv"
+#         features_df.to_csv(output_path, index=False)
+#     elif file_format == "json":
+#         if not output_path.endswith(".json"):
+#             output_path += ".json"
+#         features_df.to_json(output_path, orient='records')
+#     print(f"[DEBUG] Features saved successfully in {file_format} format at {output_path}")
+
+# if __name__ == "__main__":
+#     parser = argparse.ArgumentParser(description="Extract features from .fif files based on event timestamps.")
+#     parser.add_argument('-f', '--base_dir', required=True, help='Base directory containing LEFT and RIGHT processed files.')
+#     parser.add_argument('-o', '--output_path', required=True, help='Output path for saving the extracted features.')
+#     parser.add_argument('--file_format', choices=['json', 'csv', 'parquet'], default='parquet', help="Output format for the features.")
+#     parser.add_argument('-p', '--plot_dir', required=True, help='Directory to save plots of .fif files.')
+#     args = parser.parse_args()
+
+#     # Extract features and store them in a list of dictionaries
+#     features = load_and_extract_features(args.base_dir, args.plot_dir, sfreq=250)
+
+#     # Save the features
+#     save_features(features, args.output_path, file_format=args.file_format)
+
+
+
+## RANDOM FILE READING
+
+
+# import argparse
+# import numpy as np
+# import mne
+# from scipy.signal import butter, filtfilt, iirnotch, detrend
+# import pyxdf
+# import os
+# import re
+# import json
+
+# def load_xdf_file(filepath):
+#     """Load the XDF file using pyxdf and log details about each stream."""
+#     streams, header = pyxdf.load_xdf(filepath)
+#     print(f"Loaded XDF file: {filepath}")
+#     print(f"Number of streams: {len(streams)}")
+    
+#     for idx, stream in enumerate(streams):
+#         stream_name = stream['info']['name'][0]
+#         stream_srate = stream['info']['effective_srate']
+#         stream_shape = np.array(stream['time_series']).shape
+#         print(f"Stream {idx + 1} - Name: {stream_name}")
+#         print(f"Sampling rate: {stream_srate}")
+#         print(f"Time series shape: {stream_shape}")
+#         print(f"First 10 timestamps: {stream['time_stamps'][:10]}")
+#         print(f"First 10 data points: {np.array(stream['time_series'])[:10]}")
+        
+#     return streams, header
+
+
+# def find_xdf_files(base_dir):
+#     """Find all .xdf files within the given directory and its subdirectories."""
+#     file_paths = []
+#     for root, dirs, files in os.walk(base_dir):
+#         for file in files:
+#             if file.endswith(".xdf"):
+#                 file_paths.append(os.path.join(root, file))
+#     return file_paths
+
+
+# def load_baseline(filepath, duration_minutes=5):
+#     """
+#     Load a baseline XDF file and compute its average signal across all channels,
+#     limited to the first `duration_minutes`.
+#     """
+#     streams, header = load_xdf_file(filepath)
+#     baseline_data = None
+#     sampling_rate = None
+#     timestamps = None
+
+#     # Extract EEG data (assumes it has 10 channels)
+#     for idx, stream in enumerate(streams):
+#         stream_data = np.array(stream['time_series'])
+#         if stream_data.shape[1] == 10 and stream['info']['effective_srate'] > 0:
+#             baseline_data = stream_data
+#             sampling_rate = stream['info']['effective_srate']
+#             timestamps = np.array(stream['time_stamps'])
+#             print(f"Baseline EEG data from stream {idx + 1} loaded with shape: {baseline_data.shape}")
+#             break
+#     else:
+#         raise ValueError("No valid EEG data found in the baseline file.")
+
+#     # Limit data to the first `duration_minutes`
+#     duration_seconds = duration_minutes * 60
+#     end_time = timestamps[0] + duration_seconds
+#     valid_indices = timestamps <= end_time
+#     baseline_data_trimmed = baseline_data[valid_indices]
+
+#     print(f"Trimmed baseline data to first {duration_minutes} minutes, resulting shape: {baseline_data_trimmed.shape}")
+
+#     # Compute average signal (mean across time for each channel)
+#     baseline_noise_profile = np.mean(baseline_data_trimmed, axis=0)
+#     print(f"Computed baseline noise profile: {baseline_noise_profile}")
+    
+#     return baseline_noise_profile
+
+
+# def process_combined_xdf_files(base_dir, base_save_dir, baseline_file):
+#     """Process all .xdf files in the combined dataset and apply baseline removal."""
+#     all_files = find_xdf_files(base_dir)
+
+#     print(f"Found {len(all_files)} files in the dataset.")
+
+#     # Load the baseline noise profile
+#     print(f"Loading baseline noise from {baseline_file}...")
+#     baseline_noise = load_baseline(baseline_file)
+
+#     for file_path in all_files:
+#         print(f"Processing {file_path}...")
+#         streams, header = load_xdf_file(file_path)
+#         try:
+#             filtered_raw_L, event_timestamps_L, event_data_segments_L = perform_ICA(
+#                 streams, 'L', file_path, base_save_dir, marker='n', baseline_noise=baseline_noise
+#             )
+#             filtered_raw_R, event_timestamps_R, event_data_segments_R = perform_ICA(
+#                 streams, 'R', file_path, base_save_dir, marker='p', baseline_noise=baseline_noise
+#             )
+#         except Exception as e:
+#             print(f"Error processing {file_path}: {e}")
+
+
+# def perform_ICA(streams, side_label, xdf_filename, base_save_dir, marker, baseline_noise, trim_samples=(0, 0)):
+#     """
+#     Perform ICA on EEG data, save the ICA solution, filtered raw EEG data, and ICA-applied data.
+#     Subtract baseline noise before processing.
+#     """
+#     data, sampling_rate, timestamps, event_timestamps = None, None, None, []
+
+#     # Extract EEG data (assumes it has 10 channels)
+#     for idx, stream in enumerate(streams):
+#         stream_data = np.array(stream['time_series'])
+#         if stream_data.shape[1] == 10 and stream['info']['effective_srate'] > 0:
+#             data = stream_data
+#             sampling_rate = stream['info']['effective_srate']
+#             timestamps = np.array(stream['time_stamps'])
+#             print(f"Using EEG data from stream {idx + 1} with shape: {data.shape}")
+#             print(f"Initial data values (first 10 points): {data[:10]}")
+#             break
+#     else:
+#         raise ValueError("No valid EEG data found in the streams.")
+
+#     # Subtract baseline noise
+#     print("Subtracting baseline noise from EEG data...")
+#     data = data - baseline_noise
+#     print(f"Data after baseline subtraction - min: {np.min(data)}, max: {np.max(data)}, mean: {np.mean(data)}")
+
+#     # Identify event timestamps (assuming single-channel stream indicates events)
+#     for idx, stream in enumerate(streams):
+#         stream_data = np.array(stream['time_series'])
+#         if stream_data.shape[1] == 1:
+#             print(f"Checking stream {idx + 1} for event markers...")
+#             for ts, value in zip(stream['time_stamps'], stream_data[:, 0]):
+#                 if value == marker:  # Check if the event marker matches the side ('p' or 'n')
+#                     event_timestamps.append(ts)
+#                     print(f"Event found at {ts} with marker value {value}")
+
+#     # Validate event timestamps to ensure they're within bounds of EEG data timestamps
+#     event_timestamps_in_bounds = []
+#     for event_time in event_timestamps:
+#         if timestamps[0] <= event_time <= timestamps[-1]:  # Check bounds
+#             event_timestamps_in_bounds.append(event_time)
+#         else:
+#             print(f"[WARNING] Event at {event_time} is out of bounds and will be ignored.")
+    
+#     # Update event_timestamps with validated list
+#     event_timestamps = event_timestamps_in_bounds
+
+#     # Create MNE info and Raw object for EEG data
+#     ch_names = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4', 'GND']
+#     info = mne.create_info(ch_names=ch_names, sfreq=sampling_rate, ch_types='eeg')
+#     raw = mne.io.RawArray(data.T, info)
+
+#     # Apply montage for electrode layout
+#     montage = mne.channels.make_dig_montage({
+#         'F3': (-39, 0.33333, 0), 'Fz': (0, 0.25556, 0),
+#         'F4': (39, 0.33333, 0), 'C3': (-90, 0.25556, 0),
+#         'Cz': (0, 0, 0), 'C4': (90, 0.25556, 0),
+#         'P3': (-141, 0.33333, 0), 'Pz': (180, 0.25556, 0),
+#         'P4': (141, 0.33333, 0), 'GND': (0, -0.1, 0)
+#     })
+#     raw.set_montage(montage)
+
+#     # Filter the data
+#     filtered_raw = raw.copy().filter(l_freq=0.3, h_freq=30)
+#     filtered_raw.notch_filter(freqs=[50], method='iir')
+
+#     # Save the raw and filtered EEG data to FIF
+#     subject_id = re.findall(r'ses-S\d+', xdf_filename)[0].split('-')[1].zfill(3)
+#     output_dir = os.path.join(base_save_dir, side_label, f"{subject_id}")
+#     os.makedirs(output_dir, exist_ok=True)
+
+#     raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_raw.fif"), overwrite=True)
+#     filtered_raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_ica_filtered_raw.fif"), overwrite=True)
+
+#     # Extract and store 1.5 second windows around each event
+#     segment_duration_samples = int(1.5 * sampling_rate)
+#     event_data_segments = []
+
+#     for event_time in event_timestamps:
+#         event_index = np.searchsorted(timestamps, event_time)
+#         end_index = min(event_index + segment_duration_samples, len(timestamps))
+#         eeg_segment = data[event_index:end_index, :]
+
+#         # Append segment data to list
+#         event_data_segments.append({
+#             'event_time': event_time,
+#             'segment': eeg_segment.tolist()
+#         })
+
+#     # Save all event-related data to JSON or NPZ format
+#     json_path = os.path.join(output_dir, f"sub-{subject_id}_{side_label}_event_data.json")
+#     with open(json_path, "w") as json_file:
+#         json.dump({
+#             "side": side_label,
+#             "event_timestamps": event_timestamps,
+#             "event_data_segments": event_data_segments
+#         }, json_file, indent=4)
+
+#     # Optionally save as NPZ file
+#     npz_data_path = os.path.join(output_dir, f"sub-{subject_id}_{side_label}_event_data.npz")
+#     np.savez(npz_data_path, event_timestamps=np.array(event_timestamps), data_segments=np.array(event_data_segments))
+
+#     return filtered_raw, event_timestamps, event_data_segments
+
+
+# if __name__ == "__main__":
+#     parser = argparse.ArgumentParser(description="XDF EEG File Processor (Combined LEFT/RIGHT)")
+#     parser.add_argument('-b', '--base_dir', required=True, help='Base directory containing combined dataset with .xdf files.')
+#     parser.add_argument('-o', '--output_dir', required=True, help='Output directory to save processed files.')
+#     parser.add_argument('-bl', '--baseline_file', required=True, help='Path to the baseline .xdf file for noise subtraction.')
+#     args = parser.parse_args()
+
+#     process_combined_xdf_files(args.base_dir, args.output_dir, args.baseline_file)
+
+
+
+## LOAD XDF FILES
+
+
+# import argparse
+# import numpy as np
+# import mne
+# from scipy.signal import butter, filtfilt, iirnotch, detrend
+# import pyxdf
+# import os
+# import re
+# import json
+
+# def load_xdf_file(filepath):
+#     """Load the XDF file using pyxdf and log details about each stream."""
+#     streams, header = pyxdf.load_xdf(filepath)
+#     print(f"Loaded XDF file: {filepath}")
+#     print(f"Number of streams: {len(streams)}")
+    
+#     for idx, stream in enumerate(streams):
+#         stream_name = stream['info']['name'][0]
+#         stream_srate = stream['info']['effective_srate']
+#         stream_shape = np.array(stream['time_series']).shape
+#         print(f"Stream {idx + 1} - Name: {stream_name}")
+#         print(f"Sampling rate: {stream_srate}")
+#         print(f"Time series shape: {stream_shape}")
+#         print(f"First 10 timestamps: {stream['time_stamps'][:10]}")
+#         print(f"First 10 data points: {np.array(stream['time_series'])[:10]}")
+        
+#     return streams, header
+
+
+# def find_xdf_files(base_dir):
+#     """Find all .xdf files within the given directory and its subdirectories."""
+#     file_paths = []
+#     for root, dirs, files in os.walk(base_dir):
+#         for file in files:
+#             if file.endswith(".xdf"):
+#                 file_paths.append(os.path.join(root, file))
+#     return file_paths
+
+
+# def load_baseline(filepath, duration_minutes=5):
+#     """
+#     Load a baseline XDF file and compute its average signal across all channels,
+#     limited to the first `duration_minutes`.
+#     """
+#     streams, header = load_xdf_file(filepath)
+#     baseline_data = None
+#     sampling_rate = None
+#     timestamps = None
+
+#     # Extract EEG data (assumes it has 10 channels)
+#     for idx, stream in enumerate(streams):
+#         stream_data = np.array(stream['time_series'])
+#         if stream_data.shape[1] == 10 and stream['info']['effective_srate'] > 0:
+#             baseline_data = stream_data
+#             sampling_rate = stream['info']['effective_srate']
+#             timestamps = np.array(stream['time_stamps'])
+#             print(f"Baseline EEG data from stream {idx + 1} loaded with shape: {baseline_data.shape}")
+#             break
+#     else:
+#         raise ValueError("No valid EEG data found in the baseline file.")
+
+#     # Limit data to the first `duration_minutes`
+#     duration_seconds = duration_minutes * 60
+#     end_time = timestamps[0] + duration_seconds
+#     valid_indices = timestamps <= end_time
+#     baseline_data_trimmed = baseline_data[valid_indices]
+
+#     print(f"Trimmed baseline data to first {duration_minutes} minutes, resulting shape: {baseline_data_trimmed.shape}")
+
+#     # Compute average signal (mean across time for each channel)
+#     baseline_noise_profile = np.mean(baseline_data_trimmed, axis=0)
+#     print(f"Computed baseline noise profile: {baseline_noise_profile}")
+    
+#     return baseline_noise_profile
+
+
+
+# def subtract_baseline_and_process(input_filepath, baseline_profile, base_save_dir, side_label):
+#     """
+#     Subtract the baseline noise profile from the EEG data and perform filtering.
+#     """
+#     streams, header = load_xdf_file(input_filepath)
+#     data, sampling_rate, timestamps = None, None, None
+
+#     # Extract EEG data
+#     for idx, stream in enumerate(streams):
+#         stream_data = np.array(stream['time_series'])
+#         if stream_data.shape[1] == 10 and stream['info']['effective_srate'] > 0:
+#             data = stream_data
+#             sampling_rate = stream['info']['effective_srate']
+#             timestamps = np.array(stream['time_stamps'])
+#             print(f"Processing EEG data from stream {idx + 1} with shape: {data.shape}")
+#             break
+#     else:
+#         raise ValueError("No valid EEG data found in the input file.")
+
+#     # Subtract baseline noise profile
+#     print("Subtracting baseline noise profile...")
+#     data_corrected = data - baseline_profile
+#     print(f"Data after baseline subtraction - min: {np.min(data_corrected)}, max: {np.max(data_corrected)}, mean: {np.mean(data_corrected)}")
+
+#     # Create MNE info and Raw object for corrected EEG data
+#     ch_names = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4', 'GND']
+#     info = mne.create_info(ch_names=ch_names, sfreq=sampling_rate, ch_types='eeg')
+#     raw_corrected = mne.io.RawArray(data_corrected.T, info)
+
+#     # Apply montage
+#     montage = mne.channels.make_dig_montage({
+#         'F3': (-39, 0.33333, 0), 'Fz': (0, 0.25556, 0),
+#         'F4': (39, 0.33333, 0), 'C3': (-90, 0.25556, 0),
+#         'Cz': (0, 0, 0), 'C4': (90, 0.25556, 0),
+#         'P3': (-141, 0.33333, 0), 'Pz': (180, 0.25556, 0),
+#         'P4': (141, 0.33333, 0), 'GND': (0, -0.1, 0)
+#     })
+#     raw_corrected.set_montage(montage)
+
+#     # Filter the data
+#     print("Applying filtering...")
+#     filtered_raw = raw_corrected.copy().filter(l_freq=0.3, h_freq=30)
+#     filtered_raw.notch_filter(freqs=[50], method='iir')
+
+#     # Save the processed EEG data to FIF
+#     subject_id = re.findall(r'ses-S\d+', input_filepath)[0].split('-')[1].zfill(3)
+#     output_dir = os.path.join(base_save_dir, side_label, f"{subject_id}")
+#     os.makedirs(output_dir, exist_ok=True)
+
+#     raw_corrected.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_corrected_raw.fif"), overwrite=True)
+#     filtered_raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_filtered_raw.fif"), overwrite=True)
+
+#     print(f"Saved corrected and filtered data for {input_filepath}.")
+#     return filtered_raw
+
+
+# def process_with_baseline(base_dir, baseline_filepath, base_save_dir):
+#     """Process all files using a baseline file for noise subtraction."""
+#     baseline_profile = load_baseline(baseline_filepath)
+
+#     left_dir = os.path.join(base_dir, 'LEFT')
+#     right_dir = os.path.join(base_dir, 'RIGHT')
+
+#     left_files = find_xdf_files(left_dir)
+#     right_files = find_xdf_files(right_dir)
+
+#     print(f"Found {len(left_files)} files in LEFT directory.")
+#     print(f"Found {len(right_files)} files in RIGHT directory.")
+
+#     for left_file in left_files:
+#         print(f"Processing {left_file} with baseline subtraction...")
+#         try:
+#             subtract_baseline_and_process(left_file, baseline_profile, base_save_dir, 'L')
+#         except Exception as e:
+#             print(f"Error processing {left_file}: {e}")
+
+#     for right_file in right_files:
+#         print(f"Processing {right_file} with baseline subtraction...")
+#         try:
+#             subtract_baseline_and_process(right_file, baseline_profile, base_save_dir, 'R')
+#         except Exception as e:
+#             print(f"Error processing {right_file}: {e}")
+
+
+# if __name__ == "__main__":
+#     parser = argparse.ArgumentParser(description="XDF EEG File Processor with Baseline Subtraction")
+#     parser.add_argument('-b', '--base_dir', required=True, help='Base directory containing LEFT and RIGHT folders with .xdf files.')
+#     parser.add_argument('-o', '--output_dir', required=True, help='Output directory to save processed files.')
+#     parser.add_argument('-bl', '--baseline_file', required=True, help='Baseline XDF file for noise subtraction.')
+#     args = parser.parse_args()
+
+#     process_with_baseline(args.base_dir, args.baseline_file, args.output_dir)
+
+
+
