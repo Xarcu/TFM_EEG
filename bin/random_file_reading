@@ -6,6 +6,8 @@ import pyxdf
 import os
 import re
 import json
+from sklearn.decomposition import FastICA
+from scipy import signal
 
 def load_xdf_file(filepath):
     """Load the XDF file using pyxdf and log details about each stream."""
@@ -22,9 +24,8 @@ def load_xdf_file(filepath):
         print(f"Time series shape: {stream_shape}")
         print(f"First 10 timestamps: {stream['time_stamps'][:10]}")
         print(f"First 10 data points: {np.array(stream['time_series'])[:10]}")
-        
-    return streams, header
 
+    return streams, header
 
 def find_xdf_files(base_dir):
     """Find all .xdf files within the given directory and its subdirectories."""
@@ -54,11 +55,11 @@ def process_combined_xdf_files(base_dir, base_save_dir):
         except Exception as e:
             print(f"Error processing {file_path}: {e}")
 
-
 def perform_ICA(streams, side_label, xdf_filename, base_save_dir, marker, trim_samples=(0, 0)):
     """
-    Perform ICA on EEG data, save the ICA solution, filtered raw EEG data, and ICA-applied data.
-    Store specific data segments (1.5 seconds after events) and event timestamps in a JSON or NPZ file.
+    Perform ICA on EEG data, subtract baseline (first 10 seconds), save the ICA solution,
+    filtered raw EEG data, and ICA-applied data. Store specific data segments (1.5 seconds 
+    after events) and event timestamps in a JSON or NPZ file.
     """
     data, sampling_rate, timestamps, event_timestamps = None, None, None, []
 
@@ -70,12 +71,27 @@ def perform_ICA(streams, side_label, xdf_filename, base_save_dir, marker, trim_s
             sampling_rate = stream['info']['effective_srate']
             timestamps = np.array(stream['time_stamps'])
             print(f"Using EEG data from stream {idx + 1} with shape: {data.shape}")
-            print(f"Initial data values (first 10 points): {data[:10]}")
+            print(f"Initial data values (first 10 points): {data[:10]}")  # Checking initial data values
             break
     else:
         raise ValueError("No valid EEG data found in the streams.")
 
     print(f"Data statistics before processing - min: {np.min(data)}, max: {np.max(data)}, mean: {np.mean(data)}")
+
+    # Baseline correction: Subtract the mean of the first 10 seconds from each channel
+    baseline_duration = 10  # seconds
+    baseline_samples = int(baseline_duration * sampling_rate)  # convert to number of samples
+    baseline = np.mean(data[:baseline_samples, :], axis=0)
+    data -= baseline  # Subtract the baseline (this is done channel-wise)
+    print("Baseline correction completed.")
+
+    # Perform FastICA
+    ica = FastICA(n_components=10, random_state=0)
+    ica_data = ica.fit_transform(data)  # This is the ICA components (independent sources)
+    print("ICA completed.")
+
+    # Save ICA components (e.g., the unmixing matrix)
+    ica_components = ica.components_
 
     # Identify event timestamps (assuming single-channel stream indicates events)
     for idx, stream in enumerate(streams):
@@ -95,8 +111,7 @@ def perform_ICA(streams, side_label, xdf_filename, base_save_dir, marker, trim_s
         else:
             print(f"[WARNING] Event at {event_time} is out of bounds and will be ignored.")
     
-    # Update event_timestamps with validated list
-    event_timestamps = event_timestamps_in_bounds
+    event_timestamps = event_timestamps_in_bounds  # Update event timestamps
 
     # Create MNE info and Raw object for EEG data
     ch_names = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4', 'GND']
@@ -155,11 +170,12 @@ def perform_ICA(streams, side_label, xdf_filename, base_save_dir, marker, trim_s
 
     return filtered_raw, event_timestamps, event_data_segments
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="XDF EEG File Processor (Combined LEFT/RIGHT)")
     parser.add_argument('-b', '--base_dir', required=True, help='Base directory containing combined dataset with .xdf files.')
-    parser.add_argument('-o', '--output_dir', required=True, help='Output directory to save processed files.')
-    args = parser.parse_args()
+    parser.add_argument('-o', '--base_save_dir', required=True, help='Directory to save processed data.')
 
-    process_combined_xdf_files(args.base_dir, args.output_dir)
+    args = parser.parse_args()
+    
+    # Process the dataset
+    process_combined_xdf_files(args.base_dir, args.base_save_dir)

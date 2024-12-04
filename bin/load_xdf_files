@@ -69,8 +69,9 @@ def process_all_xdf_files(base_dir, base_save_dir):
 
 def perform_ICA(streams, side_label, xdf_filename, base_save_dir, trim_samples=(0, 0)):
     """
-    Perform ICA on EEG data, save the ICA solution, filtered raw EEG data, and ICA-applied data.
-    Store specific data segments (1.5 seconds after events) and event timestamps in a JSON or NPZ file.
+    Perform ICA on EEG data, subtract baseline (first 10 seconds), save the ICA solution,
+    filtered raw EEG data, and ICA-applied data. Store specific data segments (1.5 seconds 
+    after events) and event timestamps in a JSON or NPZ file.
     """
     data, sampling_rate, timestamps, event_timestamps = None, None, None, []
 
@@ -88,6 +89,16 @@ def perform_ICA(streams, side_label, xdf_filename, base_save_dir, trim_samples=(
         raise ValueError("No valid EEG data found in the streams.")
 
     print(f"Data statistics before processing - min: {np.min(data)}, max: {np.max(data)}, mean: {np.mean(data)}")
+
+    # **Baseline Correction: Subtract the mean of the first 10 seconds**
+    baseline_duration = 10  # seconds
+    baseline_samples = int(baseline_duration * sampling_rate)  # convert to number of samples
+    if baseline_samples > data.shape[0]:
+        raise ValueError("The dataset is shorter than the baseline duration.")
+    
+    baseline = np.mean(data[:baseline_samples, :], axis=0)  # Compute baseline mean
+    data -= baseline  # Subtract the baseline (channel-wise subtraction)
+    print("Baseline correction applied using the first 10 seconds of data.")
 
     # Identify event timestamps (assuming single-channel stream indicates events)
     for idx, stream in enumerate(streams):
@@ -107,8 +118,7 @@ def perform_ICA(streams, side_label, xdf_filename, base_save_dir, trim_samples=(
         else:
             print(f"[WARNING] Event at {event_time} is out of bounds and will be ignored.")
     
-    # Update event_timestamps with validated list
-    event_timestamps = event_timestamps_in_bounds
+    event_timestamps = event_timestamps_in_bounds  # Update event timestamps
 
     # Create MNE info and Raw object for EEG data
     ch_names = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4', 'GND']
@@ -137,7 +147,7 @@ def perform_ICA(streams, side_label, xdf_filename, base_save_dir, trim_samples=(
     raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_raw.fif"), overwrite=True)
     filtered_raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_ica_filtered_raw.fif"), overwrite=True)
 
-    # Extract and store 1.5 second windows around each event
+    # Extract and store 1.5-second windows around each event
     segment_duration_samples = int(1.5 * sampling_rate)
     event_data_segments = []
 
@@ -166,6 +176,7 @@ def perform_ICA(streams, side_label, xdf_filename, base_save_dir, trim_samples=(
     np.savez(npz_data_path, event_timestamps=np.array(event_timestamps), data_segments=np.array(event_data_segments))
 
     return filtered_raw, event_timestamps, event_data_segments
+
 
 
 if __name__ == "__main__":

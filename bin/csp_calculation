@@ -1,0 +1,224 @@
+import argparse
+import numpy as np
+import mne
+from scipy.signal import butter, filtfilt, iirnotch, detrend
+import pyxdf
+import os
+import re
+import json
+from mne.decoding import CSP
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score
+import joblib
+import pandas as pd
+
+
+def load_xdf_file(filepath):
+    """Load the XDF file using pyxdf and log details about each stream."""
+    streams, header = pyxdf.load_xdf(filepath)
+    print(f"Loaded XDF file: {filepath}")
+    print(f"Number of streams: {len(streams)}")
+    
+    for idx, stream in enumerate(streams):
+        stream_name = stream['info']['name'][0]
+        stream_srate = stream['info']['effective_srate']
+        stream_shape = np.array(stream['time_series']).shape
+        print(f"Stream {idx + 1} - Name: {stream_name}")
+        print(f"Sampling rate: {stream_srate}")
+        print(f"Time series shape: {stream_shape}")
+        print(f"First 10 timestamps: {stream['time_stamps'][:10]}")
+        print(f"First 10 data points: {np.array(stream['time_series'])[:10]}")
+        
+    return streams, header
+
+
+def find_xdf_files(base_dir):
+    """Find all .xdf files within the given directory and its subdirectories."""
+    file_paths = []
+    for root, dirs, files in os.walk(base_dir):
+        for file in files:
+            if file.endswith(".xdf"):
+                file_paths.append(os.path.join(root, file))
+    return file_paths
+
+
+def process_all_xdf_files(base_dir, base_save_dir):
+    """Process all .xdf files in the LEFT and RIGHT directories."""
+    left_dir = os.path.join(base_dir, 'LEFT')
+    right_dir = os.path.join(base_dir, 'RIGHT')
+
+    left_files = find_xdf_files(left_dir)
+    right_files = find_xdf_files(right_dir)
+
+    print(f"Found {len(left_files)} files in LEFT directory.")
+    print(f"Found {len(right_files)} files in RIGHT directory.")
+
+    for left_file in left_files:
+        print(f"Processing {left_file}...")
+        streams_L, header_L = load_xdf_file(left_file)
+        try:
+            perform_ICA(streams_L, 'L', left_file, base_save_dir)
+        except Exception as e:
+            print(f"Error processing {left_file}: {e}")
+
+    for right_file in right_files:
+        print(f"Processing {right_file}...")
+        streams_R, header_R = load_xdf_file(right_file)
+        try:
+            perform_ICA(streams_R, 'R', right_file, base_save_dir)
+        except Exception as e:
+            print(f"Error processing {right_file}: {e}")
+
+
+def perform_ICA(streams, side_label, xdf_filename, base_save_dir, trim_samples=(0, 0)):
+    """
+    Perform ICA on EEG data, apply baseline correction, and extract event-related data.
+    """
+    data, sampling_rate, timestamps, event_timestamps = None, None, None, []
+
+    # Extract EEG data (assumes it has 10 channels)
+    for idx, stream in enumerate(streams):
+        stream_data = np.array(stream['time_series'])
+        if stream_data.shape[1] == 10 and stream['info']['effective_srate'] > 0:
+            data = stream_data
+            sampling_rate = stream['info']['effective_srate']
+            timestamps = np.array(stream['time_stamps'])
+            print(f"Using EEG data from stream {idx + 1} with shape: {data.shape}")
+            break
+    else:
+        raise ValueError("No valid EEG data found in the streams.")
+
+    # Baseline correction using the first 10 seconds
+    baseline_duration = 10  # seconds
+    baseline_samples = int(baseline_duration * sampling_rate)
+    if baseline_samples > data.shape[0]:
+        raise ValueError("The dataset is shorter than the baseline duration.")
+    baseline = np.mean(data[:baseline_samples, :], axis=0)
+    data -= baseline
+    print("Baseline correction applied.")
+
+    # Identify event timestamps
+    for idx, stream in enumerate(streams):
+        stream_data = np.array(stream['time_series'])
+        if stream_data.shape[1] == 1:  # Event markers are usually in single-channel streams
+            print(f"Checking stream {idx + 1} for event markers...")
+            for ts, value in zip(stream['time_stamps'], stream_data[:, 0]):
+                if value != 0:
+                    event_timestamps.append(ts)
+
+    # Validate and bound event timestamps
+    event_timestamps = [
+        event_time for event_time in event_timestamps
+        if timestamps[0] <= event_time <= timestamps[-1]
+    ]
+
+    # Create MNE Raw object
+    ch_names = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4', 'GND']
+    info = mne.create_info(ch_names=ch_names, sfreq=sampling_rate, ch_types='eeg')
+    raw = mne.io.RawArray(data.T, info)
+
+    # Filter the data
+    filtered_raw = raw.copy().filter(l_freq=0.3, h_freq=30)
+    filtered_raw.notch_filter(freqs=[50], method='iir')
+
+    # Save raw and filtered data
+    subject_id = re.findall(r'ses-S\d+', xdf_filename)[0].split('-')[1].zfill(3)
+    output_dir = os.path.join(base_save_dir, side_label, f"{subject_id}")
+    os.makedirs(output_dir, exist_ok=True)
+    raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_raw.fif"), overwrite=True)
+    filtered_raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_ica_filtered_raw.fif"), overwrite=True)
+
+    # Extract 1.5-second windows around each event
+    segment_duration_samples = int(1.5 * sampling_rate)
+    event_data_segments = []
+    for event_time in event_timestamps:
+        event_index = np.searchsorted(timestamps, event_time)
+        end_index = event_index + segment_duration_samples
+        if end_index > data.shape[0]:
+            print(f"[WARNING] Skipping event at {event_time}: insufficient data for segment.")
+            continue
+        eeg_segment = data[event_index:end_index, :]
+        # Handle mismatched segment sizes
+        if eeg_segment.shape[0] < segment_duration_samples:
+            eeg_segment = np.pad(eeg_segment, ((0, segment_duration_samples - eeg_segment.shape[0]), (0, 0)), 'edge')
+        elif eeg_segment.shape[0] > segment_duration_samples:
+            eeg_segment = eeg_segment[:segment_duration_samples, :]
+        event_data_segments.append({'event_time': event_time, 'segment': eeg_segment.tolist()})
+
+    # Save event data
+    json_path = os.path.join(output_dir, f"sub-{subject_id}_{side_label}_event_data.json")
+    with open(json_path, "w") as json_file:
+        json.dump({
+            "side": side_label,
+            "event_timestamps": event_timestamps,
+            "event_data_segments": event_data_segments
+        }, json_file, indent=4)
+
+
+def prepare_csp_data(base_save_dir):
+    """Load event-related data for CSP."""
+    data, labels = [], []
+    for side in ['L', 'R']:
+        side_dir = os.path.join(base_save_dir, side)
+        if not os.path.exists(side_dir):
+            print(f"[WARNING] Directory not found: {side_dir}. Skipping.")
+            continue
+        
+        for subject_folder in os.listdir(side_dir):
+            subject_path = os.path.join(side_dir, subject_folder)
+            json_path = os.path.join(subject_path, f"sub-{subject_folder}_{side}_event_data.json")
+            if os.path.exists(json_path):
+                with open(json_path, "r") as f:
+                    event_data = json.load(f)
+                for segment in event_data['event_data_segments']:
+                    eeg_segment = np.array(segment['segment'])
+                    data.append(eeg_segment)
+                    labels.append(0 if side == 'L' else 1)
+
+    return np.array(data), np.array(labels)
+
+
+def compute_csp_and_train(base_save_dir):
+    """Train CSP classifier and save processed data."""
+    data, labels = prepare_csp_data(base_save_dir)
+    if len(data) == 0 or len(labels) == 0:
+        raise ValueError("No data or labels found for CSP computation.")
+
+    # Save data and labels as a Parquet file for later inspection or reuse
+    features_df = pd.DataFrame({
+        "features": [segment.tolist() for segment in data],
+        "labels": labels
+    })
+    parquet_path = os.path.join(base_save_dir, 'csp_features_labels.parquet')
+    features_df.to_parquet(parquet_path, index=False)
+    print(f"Features and labels saved to Parquet file: {parquet_path}")
+
+    # Prepare data for CSP
+    reshaped_data = data.transpose(0, 2, 1)  # CSP requires (n_trials, n_channels, n_times)
+    X_train, X_test, y_train, y_test = train_test_split(reshaped_data, labels, test_size=0.2, random_state=42)
+
+    csp = CSP(n_components=4, reg=None, log=True)
+    clf = SVC(kernel='linear', probability=True)
+    pipeline = Pipeline([('csp', csp), ('classifier', clf)])
+    
+    pipeline.fit(X_train, y_train)
+    y_pred = pipeline.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    print(f"Accuracy: {acc * 100:.2f}%")
+
+    # Save the trained classifier as a Pickle file
+    pkl_path = os.path.join(base_save_dir, 'csp_classifier.pkl')
+    joblib.dump(pipeline, pkl_path)
+    print(f"Trained classifier saved to Pickle file: {pkl_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="EEG CSP Training")
+    parser.add_argument('-b', '--base_dir', required=True, help="Base directory containing EEG data")
+    parser.add_argument('-o', '--output_dir', required=True, help="Output directory for processed data")
+    args = parser.parse_args()
+
+    process_all_xdf_files(args.base_dir, args.output_dir)
+    compute_csp_and_train(args.output_dir)
