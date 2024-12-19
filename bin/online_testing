@@ -1,192 +1,185 @@
-import os
 import argparse
-import mne
+import os
 import numpy as np
-import pandas as pd
+import mne
+import joblib
+from pylsl import StreamInlet, resolve_stream
+import time
+import threading
+import random
 import json
-import matplotlib.pyplot as plt
-from scipy.stats import kurtosis, skew, entropy
-from pyeeg import samp_entropy, permutation_entropy
-from antropy import higuchi_fd
+import sys
+import winsound  # Optional: Use this for sound feedback on Windows
 
-def plot_eeg(raw, subject_folder, plot_dir):
-    """ Plot raw EEG data and save the plot to the specified directory. """
-    plt.figure(figsize=(10, 6))
-    raw.plot(scalings='auto', show=False, block=False)
-    plot_path = os.path.join(plot_dir, f"{subject_folder}_eeg_plot.png")
-    plt.savefig(plot_path)
-    plt.close()
-    print(f"[DEBUG] EEG plot saved to {plot_path}")
+# Global variables
+stop_event = threading.Event()
+baseline_event = threading.Event()
+baseline_data = []
+baseline_mean = None
+lock = threading.Lock()
 
-def fractal_dimension_higuchi(signal, kmax=10):
-    """ Calculate the Higuchi fractal dimension of a signal. """
-    return higuchi_fd(signal, kmax)
+def load_model(model_path):
+    """Load a pre-trained model."""
+    return joblib.load(model_path)
 
-def hurst_exponent(signal):
-    """ Calculate the Hurst exponent of a signal. """
-    N = len(signal)
-    T = np.arange(1, N + 1)
-    Y = np.cumsum(signal - np.mean(signal))
-    R = np.max(Y) - np.min(Y)
-    S = np.std(signal)
-    return np.log(R / S) / np.log(N) if S != 0 else np.nan
+def receive_lsl_data(inlet, duration=1.0):
+    """Receive data from the LSL stream for a given duration."""
+    start_time = time.time()
+    data = []
+    timestamps = []
+    while (time.time() - start_time) < duration:
+        sample, timestamp = inlet.pull_sample()
+        if sample is not None:
+            data.append(sample)
+            timestamps.append(timestamp)
+    return np.array(data), np.array(timestamps)
 
-def lempel_ziv_complexity(signal):
-    """ Calculate Lempel-Ziv complexity of a signal. """
-    signal_str = ''.join(str(int(x)) for x in (signal > np.mean(signal)))
-    i, lz_complexity, n = 0, 1, len(signal_str)
-    while i < n - 1:
-        for j in range(1, n - i):
-            if signal_str[i:i + j] not in signal_str[:i]:
-                lz_complexity += 1
-                break
-        i += 1
-    return lz_complexity / len(signal_str) if len(signal_str) > 0 else 0
+def generate_random_target():
+    """Generate a random target: 0 for LEFT, 1 for RIGHT."""
+    return random.choice([0, 1])
 
-def extract_features_from_events(raw, events, window_duration=1.5, sfreq=250):
-    """ Extract features from each event and store them with separate rows for each channel. """
-    features_list = []
-    max_time = raw.n_times / sfreq
-    print(f"[DEBUG] Data duration: {max_time}s, Sampling rate: {sfreq}Hz")
+def process_and_classify(data_source, csp, classifier, feedback_duration=1.0, mode="online", sfreq=250):
+    global baseline_mean, baseline_data
 
-    event_times_sec = events - events.min()
-    print(f"Adjusted Event Times (in seconds): {event_times_sec}")
+    print("Press Enter to stop the program after baseline recording is complete.")
+    print("Waiting for data...")
 
-    out_of_bounds_events = event_times_sec[(event_times_sec < 0) | (event_times_sec > max_time)]
-    if len(out_of_bounds_events) > 0:
-        print("Out of bounds events found:", out_of_bounds_events)
-    else:
-        print("All events are within the EEG data duration.")
+    correct_predictions = 0
+    total_predictions = 0
 
-    for idx, timestamp in enumerate(event_times_sec):
-        if timestamp < 0 or timestamp + window_duration > max_time:
-            continue  # Skip out-of-bounds events
+    while not stop_event.is_set():
+        # Check if baseline recording is in progress
+        with lock:
+            if baseline_event.is_set():
+                # Fetch data to accumulate for baseline
+                data, _ = receive_lsl_data(data_source, duration=feedback_duration)
+                if data.size == 0:
+                    continue
+                baseline_data.append(data)
+                print(f"Received {data.shape[0]} samples.\nCollecting baseline data...")
+                continue  # Skip predictions and target generation
 
-        start_sample = int(timestamp * sfreq)
-        end_sample = start_sample + int(window_duration * sfreq)
-        data_window, _ = raw[:, start_sample:end_sample]
-
-        for ch_idx, ch_data in enumerate(data_window):
-            features = {
-                'channel': raw.ch_names[ch_idx],
-                'rms': np.sqrt(np.mean(ch_data ** 2)),
-                'ptp': np.ptp(ch_data),
-                'skewness': skew(ch_data),
-                'kurtosis': kurtosis(ch_data),
-                'hurst_exponent': hurst_exponent(ch_data),
-            }
-
-            try:
-                # Higuchi fractal dimension
-                features['fractal_dimension'] = fractal_dimension_higuchi(ch_data)
-            except Exception as e:
-                print(f"[WARNING] Higuchi fractal dimension error: {e}")
-                features['fractal_dimension'] = np.nan
-
-            psd, freqs = mne.time_frequency.psd_array_multitaper(
-                ch_data[None, :], sfreq, fmin=0.5, fmax=40, verbose=False
-            )
-            features.update({
-                'delta_power': psd[0, (freqs >= 0.5) & (freqs < 4)].mean(),
-                'theta_power': psd[0, (freqs >= 4) & (freqs < 8)].mean(),
-                'alpha_power': psd[0, (freqs >= 8) & (freqs < 13)].mean(),
-                'beta_power': psd[0, (freqs >= 13) & (freqs < 30)].mean(),
-                'gamma_power': psd[0, (freqs >= 30) & (freqs < 40)].mean()
-            })
-
-            try:
-                features.update({
-                    'sample_entropy': samp_entropy(ch_data, 2, 0.2 * np.std(ch_data)),
-                    'permutation_entropy': permutation_entropy(ch_data, 3, 1),
-                })
-
-                # Shannon entropy using SciPy
-                hist, bin_edges = np.histogram(ch_data, bins=50, density=True)
-                features['shannon_entropy'] = entropy(hist)
-
-                # Lempel-Ziv Complexity
-                features['lziv_complexity'] = lempel_ziv_complexity(ch_data)
-            except Exception as e:
-                print(f"[WARNING] Entropy calculation error: {e}")
-
-            features_list.append(features)
-
-    return features_list
-
-
-def load_and_extract_features(base_dir, plot_dir, sfreq=250):
-    """ Load .fif files and extract features, adding 'side' and 'channel' for each trial. """
-    left_dir = os.path.join(base_dir, 'L')
-    right_dir = os.path.join(base_dir, 'R')
-    all_features = []
-
-    for side, side_dir in zip(["left", "right"], [left_dir, right_dir]):
-        if not os.path.exists(side_dir):
-            print(f"[ERROR] Directory not found: {side_dir}")
+        # If no baseline mean is calculated yet, skip predictions
+        if baseline_mean is None:
             continue
-        
-        for subject_folder in sorted(os.listdir(side_dir)):
-            subject_path = os.path.join(side_dir, subject_folder)
-            if not os.path.isdir(subject_path):
-                continue  # Skip non-directory items
-            
-            raw_file, npz_file = None, None
-            for root, _, files in os.walk(subject_path):
-                for file in files:
-                    if file.endswith('_raw.fif'):
-                        raw_file = os.path.join(root, file)
-                    elif file.endswith('_event_data.npz'):
-                        npz_file = os.path.join(root, file)
-            
-            if raw_file and npz_file:
-                try:
-                    raw = mne.io.read_raw_fif(raw_file, preload=True, verbose=False)
-                    plot_eeg(raw, subject_folder, plot_dir)  # Plot EEG data
 
-                    npz_data = np.load(npz_file, allow_pickle=True)
-                    events_data = np.array(npz_data['event_timestamps'], dtype=float)
-                    
-                    features = extract_features_from_events(raw, events_data, window_duration=0.5, sfreq=sfreq)
-                    for feat in features:
-                        feat['side'] = side  # Add side info
-                        feat['subject'] = subject_folder  # Track subject
-                        all_features.append(feat)
-                except Exception as e:
-                    print(f"[ERROR] Error processing subject {subject_folder}: {e}")
-            else:
-                print(f"[DEBUG] Missing files for subject {subject_folder}.")
-    
-    return all_features
+        # Generate a random target (label) and display it
+        target = generate_random_target()
+        print(f"Target: {'LEFT' if target == 0 else 'RIGHT'}")
 
-def save_features(features, output_path, file_format="parquet"):
-    """Save the extracted features to a specified format with a side column for left/right info."""
-    print(f"[DEBUG] Saving features to {output_path} as {file_format} format.")
-    features_df = pd.DataFrame(features)
-    
-    if file_format == "parquet":
-        if not output_path.endswith(".parquet"):
-            output_path += ".parquet"
-        features_df.to_parquet(output_path)
-    elif file_format == "csv":
-        if not output_path.endswith(".csv"):
-            output_path += ".csv"
-        features_df.to_csv(output_path, index=False)
-    elif file_format == "json":
-        if not output_path.endswith(".json"):
-            output_path += ".json"
-        features_df.to_json(output_path, orient='records')
-    print(f"[DEBUG] Features saved successfully in {file_format} format at {output_path}")
+        # Play sound for LEFT/RIGHT
+        if target == 0:
+            winsound.Beep(600, 300)  # LOWER tone for LEFT
+        else:
+            winsound.Beep(1000, 300)  # HIGHER tone for RIGHT
+
+        # Fetch data: online from LSL
+        data, _ = receive_lsl_data(data_source, duration=feedback_duration)
+        if data.size == 0:
+            continue
+
+        print(f"Received {data.shape[0]} samples.")
+
+        # Prepare channel info and sampling rate
+        ch_names = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4', 'GND']
+        if data.shape[1] != len(ch_names):
+            print(f"Unexpected number of channels: {data.shape[1]} (expected {len(ch_names)})")
+            continue
+
+        # Subtract baseline if available
+        if baseline_mean is not None:
+            data -= baseline_mean
+
+        # Create MNE Raw object
+        info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types='eeg')
+        raw = mne.io.RawArray(data.T, info)
+
+        # Filter the data
+        filtered_raw = raw.copy().filter(l_freq=0.3, h_freq=30, fir_design='firwin', filter_length='auto', phase='zero')
+        filtered_raw.notch_filter(freqs=[50], method='iir')
+
+        # Reshape data for CSP transformation
+        reshaped_data = filtered_raw.get_data()[np.newaxis, :, :]  # Add a trial dimension
+        if reshaped_data.shape[1] != len(csp.patterns_):  # Check number of channels matches CSP training
+            print(f"Mismatch in channels: expected {len(csp.patterns_)}, got {reshaped_data.shape[1]}")
+            continue
+
+        csp_features = csp.transform(reshaped_data)  # Output shape: (1, n_components)
+
+        # Classify using the trained model
+        try:
+            prediction = classifier.predict(csp_features)[0]  # Extract single prediction
+        except Exception as e:
+            print(f"Error during classification: {e}")
+            continue
+
+        # Determine prediction outcome
+        print(f"Prediction: {'LEFT' if prediction == 0 else 'RIGHT'}")
+        total_predictions += 1
+        if prediction == target:
+            correct_predictions += 1
+
+    if total_predictions > 0:
+        accuracy = correct_predictions / total_predictions * 100
+        print(f"Correct: {correct_predictions}, Total: {total_predictions}")
+        print(f"Classification Accuracy: {accuracy:.2f}%")
+    else:
+        print("No predictions made.")
+
+def monitor_keyboard():
+    """Monitor keyboard input to stop the program or handle baseline collection."""
+    global baseline_event, baseline_mean
+
+    print("Press 'S' to start baseline recording. Press 'S' again to stop.")
+
+    while not stop_event.is_set():
+        key = input("Press 'S' to toggle baseline recording, or Enter to stop: ").strip().upper()
+        if key == "S":
+            with lock:
+                if baseline_event.is_set():
+                    baseline_event.clear()
+                    print("Baseline recording stopped.")
+
+                    # Compute baseline mean
+                    if len(baseline_data) > 0:
+                        all_baseline_data = np.vstack(baseline_data)
+                        baseline_mean = np.mean(all_baseline_data, axis=0)
+                        print(f"Baseline computed: {baseline_mean}")
+                        baseline_data.clear()
+                else:
+                    baseline_event.set()
+                    print("Baseline recording started.")
+        elif key == "":
+            stop_event.set()
+            print("Stopping the program...")
+
+def main(base_save_dir, csp_model_path, classifier_model_path, mode, feedback_duration=1.0):
+    """Main function to set up LSL stream and process data."""
+    # Load CSP and classifier models
+    csp = load_model(csp_model_path)
+    classifier = load_model(classifier_model_path)
+
+    print("Looking for an EEG stream...")
+    streams = resolve_stream('type', 'EEG')
+    if not streams:
+        print("No EEG streams found. Ensure the LSL stream is active.")
+        return
+
+    inlet = StreamInlet(streams[0])
+    sfreq = inlet.info().nominal_srate()  # Get the sampling frequency
+
+    # Start a thread to monitor keyboard input
+    keyboard_thread = threading.Thread(target=monitor_keyboard, daemon=True)
+    keyboard_thread.start()
+
+    # Process and classify data in real-time
+    process_and_classify(inlet, csp, classifier, feedback_duration, mode, sfreq)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Extract features from .fif files based on event timestamps.")
-    parser.add_argument('-f', '--base_dir', required=True, help='Base directory containing LEFT and RIGHT processed files.')
-    parser.add_argument('-o', '--output_path', required=True, help='Output path for saving the extracted features.')
-    parser.add_argument('--file_format', choices=['json', 'csv', 'parquet'], default='parquet', help="Output format for the features.")
-    parser.add_argument('-p', '--plot_dir', required=True, help='Directory to save plots of .fif files.')
+    parser = argparse.ArgumentParser(description="Real-time EEG Classification with CSP and Trained Classifier")
+    parser.add_argument('-c', '--csp_model_path', required=True, help="Path to the pre-trained CSP model")
+    parser.add_argument('-k', '--classifier_model_path', required=True, help="Path to the pre-trained classifier model")
+    parser.add_argument('-d', '--duration', type=float, default=1, help="Duration for feedback in seconds")
     args = parser.parse_args()
 
-    # Extract features and store them in a list of dictionaries
-    features = load_and_extract_features(args.base_dir, args.plot_dir, sfreq=250)
-
-    # Save the features
-    save_features(features, args.output_path, file_format=args.file_format)
+    main("dummy_base_save_dir", args.csp_model_path, args.classifier_model_path, "online", args.duration)
