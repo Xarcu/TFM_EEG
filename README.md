@@ -20,3 +20,16 @@ For git, we will commit with one of the following tags:
 - `[DEL]` removing code
 - `[TMP]` temporary commit. should be avoided when possible.
 
+### Notebooks of interest
+
+**Literature_Features_final_v**
+It focuses on the development and analysis of literature-based features in the context of CSP and their application in machine learning.
+
+**Literature_Analysis_additional_plots**
+The focus of this notebook is on generating additional plots and visual analyses related to literature-based features for machine learning applications.
+
+**CSP_Analysis_final_v**
+It emphasizes the analysis of CSP features and their integration within machine learning workflows.
+
+### Codes of interest
+
