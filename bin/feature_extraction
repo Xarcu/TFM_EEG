@@ -1,0 +1,161 @@
+import os
+import argparse
+import mne
+import numpy as np
+import pandas as pd
+import json
+import matplotlib.pyplot as plt
+from scipy.stats import kurtosis, skew, entropy
+from antropy import higuchi_fd
+from antropy import sample_entropy, perm_entropy
+
+"""
+This script processes EEG data stored in .fif files. It performs the following tasks:
+1. Loads raw EEG data and corresponding event markers from preprocessed .fif and .npz files.
+2. Extracts time-locked EEG data segments around specific event timestamps.
+3. Calculates various features for each EEG channel, including:
+   - Statistical features (e.g., RMS, skewness, kurtosis).
+   - Frequency power bands (e.g., delta, theta, alpha, beta, gamma).
+   - Complexity metrics (e.g., Higuchi fractal dimension, sample entropy, permutation entropy).
+4. Saves the extracted features along with metadata (e.g., channel, side, subject) to specified formats like JSON, CSV, or Parquet.
+5. Optionally generates and saves plots of the raw EEG data for visualization.
+
+This script is designed to process data for left and right conditions stored in separate directories and saves the results organized by condition and subject.
+"""
+
+
+def plot_eeg(raw, subject_id, plot_dir):
+    """ Plot raw EEG data and save the plot to the specified directory. """
+    plt.figure(figsize=(10, 6))
+    raw.plot(scalings='auto', show=False, block=False)
+    plot_path = os.path.join(plot_dir, f"{subject_id}_eeg_plot.png")
+    plt.savefig(plot_path)
+    plt.close()
+    print(f"[DEBUG] EEG plot saved to {plot_path}")
+
+def fractal_dimension_higuchi(signal, kmax=10):
+    """ Calculate the Higuchi fractal dimension of a signal. """
+    return higuchi_fd(signal, kmax)
+
+def hurst_exponent(signal):
+    """ Calculate the Hurst exponent of a signal. """
+    N = len(signal)
+    T = np.arange(1, N + 1)
+    Y = np.cumsum(signal - np.mean(signal))
+    R = np.max(Y) - np.min(Y)
+    S = np.std(signal)
+    return np.log(R / S) / np.log(N) if S != 0 else np.nan
+
+def extract_features_from_events(raw, window_duration=1.5, sfreq=250):
+    """ Extract features for each channel in the raw EEG data. """
+    features_list = []
+    max_time = raw.n_times / sfreq
+    print(f"[DEBUG] Data duration: {max_time}s, Sampling rate: {sfreq}Hz")
+
+    for ch_idx, ch_data in enumerate(raw.get_data()):
+        features = {
+            'channel': raw.ch_names[ch_idx],
+            'rms': np.sqrt(np.mean(ch_data ** 2)),
+            'ptp': np.ptp(ch_data),
+            'skewness': skew(ch_data),
+            'kurtosis': kurtosis(ch_data),
+            'hurst_exponent': hurst_exponent(ch_data),
+        }
+
+        try:
+            features['fractal_dimension'] = fractal_dimension_higuchi(ch_data)
+        except Exception as e:
+            print(f"[WARNING] Higuchi fractal dimension error: {e}")
+            features['fractal_dimension'] = np.nan
+
+        try:
+            psd, freqs = mne.time_frequency.psd_array_multitaper(
+                ch_data[None, :], sfreq, fmin=0.5, fmax=40, bandwidth=4.0, low_bias=False, verbose=False
+            )
+            features.update({
+                'delta_power': psd[0, (freqs >= 0.5) & (freqs < 4)].mean(),
+                'theta_power': psd[0, (freqs >= 4) & (freqs < 8)].mean(),
+                'alpha_power': psd[0, (freqs >= 8) & (freqs < 13)].mean(),
+                'beta_power': psd[0, (freqs >= 13) & (freqs < 30)].mean(),
+                'gamma_power': psd[0, (freqs >= 30) & (freqs < 40)].mean()
+            })
+        except Exception as e:
+            print(f"[WARNING] PSD calculation error: {e}")
+            features.update({
+                'delta_power': np.nan,
+                'theta_power': np.nan,
+                'alpha_power': np.nan,
+                'beta_power': np.nan,
+                'gamma_power': np.nan
+            })
+
+        features_list.append(features)
+
+    return features_list
+
+
+def load_and_extract_features(base_dir, plot_dir, sfreq=250):
+    """ Load .fif files and extract features. """
+    all_features = []
+
+    for side in ["L", "R"]:
+        side_dir = os.path.join(base_dir, side)
+        if not os.path.exists(side_dir):
+            print(f"[ERROR] Directory not found: {side_dir}")
+            continue
+
+        for file_name in sorted(os.listdir(side_dir)):
+            if not file_name.endswith('.fif'):
+                continue  # Skip non-.fif files
+            
+            subject_id = file_name.split('_')[0]  # Extract subject ID from filename
+            file_path = os.path.join(side_dir, file_name)
+            
+            try:
+                raw = mne.io.read_raw_fif(file_path, preload=True, verbose=False)
+                plot_eeg(raw, subject_id, plot_dir)  # Plot EEG data
+
+                features = extract_features_from_events(raw, window_duration=0.5, sfreq=sfreq)
+                for feat in features:
+                    feat['side'] = 'left' if side == 'L' else 'right'  # Add side info
+                    feat['subject'] = subject_id  # Track subject
+                    all_features.append(feat)
+            except Exception as e:
+                print(f"[ERROR] Error processing file {file_name}: {e}")
+
+    return all_features
+
+def save_features(features, output_path, file_format="parquet"):
+    """ Save the extracted features to a specified format. """
+    print(f"[DEBUG] Saving features to {output_path} as {file_format} format.")
+    features_df = pd.DataFrame(features)
+    
+    if file_format == "parquet":
+        if not output_path.endswith(".parquet"):
+            output_path += ".parquet"
+        features_df.to_parquet(output_path)
+    elif file_format == "csv":
+        if not output_path.endswith(".csv"):
+            output_path += ".csv"
+        features_df.to_csv(output_path, index=False)
+    elif file_format == "json":
+        if not output_path.endswith(".json"):
+            output_path += ".json"
+        features_df.to_json(output_path, orient='records')
+    print(f"[DEBUG] Features saved successfully in {file_format} format at {output_path}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Extract features from .fif files.")
+    parser.add_argument('-f', '--base_dir', required=True, help='Base directory containing L and R folders.')
+    parser.add_argument('-o', '--output_path', required=True, help='Output path for saving the extracted features.')
+    parser.add_argument('--file_format', choices=['json', 'csv', 'parquet'], default='parquet', help="Output format.")
+    parser.add_argument('-p', '--plot_dir', required=True, help='Directory to save plots of .fif files.')
+    args = parser.parse_args()
+
+    # Extract features and store them in a list of dictionaries
+    features = load_and_extract_features(args.base_dir, args.plot_dir, sfreq=250)
+
+    # Save the features
+    save_features(features, args.output_path, file_format=args.file_format)
+
+

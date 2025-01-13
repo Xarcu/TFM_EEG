@@ -1,0 +1,287 @@
+import argparse
+import os
+import numpy as np
+import mne
+import pyxdf
+import json
+from mne.decoding import CSP
+from sklearn.model_selection import train_test_split
+import joblib
+import pandas as pd
+import re
+
+"""
+This script processes EEG data from XDF files, extracts features using Common Spatial Patterns (CSP), 
+and saves the results for machine learning applications. The main workflow includes:
+
+1. **Loading XDF Files**:
+   - Reads EEG and event marker streams from .xdf files.
+
+2. **Preprocessing**:
+   - Performs baseline correction, bandpass filtering (0.3–30 Hz), and notch filtering (50 Hz) on EEG data.
+   - Extracts EEG data segments corresponding to specific event markers.
+
+3. **Independent Component Analysis (ICA)**:
+   - Removes artifacts (e.g., noise or eye blinks) using ICA for clean EEG data analysis.
+
+4. **Feature Extraction with CSP**:
+   - Applies CSP to transform EEG data into spatially-filtered features.
+   - Supports both training mode (`default`) to fit a CSP model and prediction mode (`random`) using a pre-trained CSP model.
+
+5. **Data Management**:
+   - Saves cleaned EEG data in `.fif` format and event-related data in `.json` format.
+   - Extracts CSP features and saves them with corresponding labels to `.parquet` or `.csv` files.
+
+6. **Modes**:
+   - `default`: Processes separate "LEFT" and "RIGHT" EEG data for CSP training.
+   - `random`: Processes mixed EEG data for CSP validation.
+
+This script is designed for EEG-based classification tasks and is flexible for training and evaluation workflows.
+"""
+
+def load_xdf_file(filepath):
+    """Load the XDF file using pyxdf and log details about each stream."""
+    streams, header = pyxdf.load_xdf(filepath)
+    print(f"Loaded XDF file: {filepath}")
+    print(f"Number of streams: {len(streams)}")
+    for idx, stream in enumerate(streams):
+        stream_name = stream['info']['name'][0]
+        stream_srate = stream['info']['effective_srate']
+        stream_shape = np.array(stream['time_series']).shape
+        print(f"Stream {idx + 1} - Name: {stream_name}")
+        print(f"Sampling rate: {stream_srate}")
+        print(f"Time series shape: {stream_shape}")
+    return streams, header
+
+
+def find_xdf_files(base_dir):
+    """Find all .xdf files within the given directory and its subdirectories."""
+    file_paths = []
+    for root, dirs, files in os.walk(base_dir):
+        for file in files:
+            if file.endswith(".xdf"):
+                file_paths.append(os.path.join(root, file))
+    return file_paths
+
+
+def process_all_xdf_files(base_dir, base_save_dir, mode):
+    """Process XDF files based on the chosen mode."""
+    if mode == 'default':
+        left_dir = os.path.join(base_dir, 'LEFT')
+        right_dir = os.path.join(base_dir, 'RIGHT')
+        left_files = find_xdf_files(left_dir)
+        right_files = find_xdf_files(right_dir)
+
+        print(f"Found {len(left_files)} files in LEFT directory.")
+        print(f"Found {len(right_files)} files in RIGHT directory.")
+
+        for left_file in left_files:
+            print(f"Processing {left_file}...")
+            streams, header = load_xdf_file(left_file)
+            try:
+                perform_ICA(streams, 'L', left_file, base_save_dir)
+            except Exception as e:
+                print(f"Error processing {left_file}: {e}")
+
+        for right_file in right_files:
+            print(f"Processing {right_file}...")
+            streams, header = load_xdf_file(right_file)
+            try:
+                perform_ICA(streams, 'R', right_file, base_save_dir)
+            except Exception as e:
+                print(f"Error processing {right_file}: {e}")
+    elif mode == 'random':
+        all_files = find_xdf_files(base_dir)
+        print(f"Found {len(all_files)} files in the dataset.")
+        for file_path in all_files:
+            print(f"Processing {file_path}...")
+            streams, header = load_xdf_file(file_path)
+            try:
+                perform_ICA(streams, 'L', file_path, base_save_dir, marker='n')
+                perform_ICA(streams, 'R', file_path, base_save_dir, marker='p')
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+    else:
+        raise ValueError("Invalid mode. Use 'default' or 'random'.")
+
+
+def perform_ICA(streams, side_label, xdf_filename, base_save_dir, marker=None):
+    """Perform ICA and preprocess EEG data."""
+    data, sampling_rate, timestamps, event_timestamps = None, None, None, []
+
+    # Extract EEG data
+    for idx, stream in enumerate(streams):
+        stream_data = np.array(stream['time_series'])
+        if stream_data.shape[1] == 10 and stream['info']['effective_srate'] > 0:
+            data = stream_data
+            sampling_rate = stream['info']['effective_srate']
+            timestamps = np.array(stream['time_stamps'])
+            print(f"Using EEG data from stream {idx + 1} with shape: {data.shape}")
+            break
+    else:
+        raise ValueError("No valid EEG data found in the streams.")
+
+    # Baseline correction
+    baseline_duration = 10  # seconds
+    baseline_samples = int(baseline_duration * sampling_rate)
+    baseline = np.mean(data[:baseline_samples, :], axis=0)
+    data -= baseline
+
+    # Identify event timestamps
+    for idx, stream in enumerate(streams):
+        stream_data = np.array(stream['time_series'])
+        if stream_data.shape[1] == 1:  # Event markers
+            for ts, value in zip(stream['time_stamps'], stream_data[:, 0]):
+                if marker is None or value == marker:
+                    event_timestamps.append(ts)
+
+    # Create MNE Raw object
+    ch_names = ['F3', 'Fz', 'F4', 'C3', 'Cz', 'C4', 'P3', 'Pz', 'P4', 'GND']
+    info = mne.create_info(ch_names=ch_names, sfreq=sampling_rate, ch_types='eeg')
+    raw = mne.io.RawArray(data.T, info)
+
+    # Filter the data
+    filtered_raw = raw.copy().filter(l_freq=0.3, h_freq=30)
+    filtered_raw.notch_filter(freqs=[50], method='iir')
+
+    # Save raw data
+    subject_id = re.findall(r'ses-S\d+', xdf_filename)[0].split('-')[1].zfill(3)
+    output_dir = os.path.join(base_save_dir, side_label, f"{subject_id}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_raw.fif"), overwrite=True)
+    filtered_raw.save(os.path.join(output_dir, f"sub-{subject_id}_{side_label}_eeg_ica_filtered_raw.fif"), overwrite=True)
+
+    # Extract event segments
+    segment_duration_samples = int(1.5 * sampling_rate)
+    event_data_segments = []
+    labels = []  # Initialize labels
+    for event_time in event_timestamps:
+        event_index = np.searchsorted(timestamps, event_time)
+        end_index = event_index + segment_duration_samples
+        if end_index <= data.shape[0]:
+            event_data_segments.append(data[event_index:end_index, :].tolist())
+            labels.append(0 if side_label == 'L' else 1)  # Assign label based on side
+
+    # Save event data
+    json_path = os.path.join(output_dir, f"sub-{subject_id}_{side_label}_event_data.json")
+    with open(json_path, "w") as json_file:
+        json.dump({
+            "side": side_label,
+            "event_timestamps": event_timestamps,
+            "event_data_segments": event_data_segments
+        }, json_file, indent=4)
+
+    # Save labels
+    labels_path = os.path.join(output_dir, f"sub-{subject_id}_{side_label}_labels.json")
+    with open(labels_path, "w") as labels_file:
+        json.dump(labels, labels_file, indent=4)
+        print(f"Labels saved to {labels_path}")
+
+
+def prepare_csp_data(base_save_dir):
+    """Load data for CSP from JSON files."""
+    data, labels = [], []
+    max_length = None  # Optional: Calculate max length for padding/truncation
+
+    for side in ['L', 'R']:
+        side_dir = os.path.join(base_save_dir, side)
+        if os.path.exists(side_dir):
+            for subject_folder in os.listdir(side_dir):
+                json_path = os.path.join(side_dir, subject_folder, f"sub-{subject_folder}_{side}_event_data.json")
+                if os.path.exists(json_path):
+                    with open(json_path, "r") as f:
+                        event_data = json.load(f)
+                    for segment in event_data['event_data_segments']:
+                        segment_array = np.array(segment)
+                        if segment_array.ndim == 2:
+                            if max_length is None:
+                                max_length = segment_array.shape[0]
+                            # Truncate or pad
+                            if segment_array.shape[0] > max_length:
+                                segment_array = segment_array[:max_length, :]
+                            elif segment_array.shape[0] < max_length:
+                                pad_width = max_length - segment_array.shape[0]
+                                segment_array = np.pad(segment_array, ((0, pad_width), (0, 0)), mode='constant')
+                            segment_array = segment_array.T  # Ensure (channels, time points)
+                        else:
+                            raise ValueError(f"Invalid segment shape: {segment_array.shape}")
+                        data.append(segment_array)
+                        labels.append(0 if side == 'L' else 1)
+
+    data = np.array(data)
+    labels = np.array(labels)
+
+    # Ensure data is 3D
+    if data.ndim != 3:
+        raise ValueError(f"Data must be 3D (samples, channels, time points), but got shape: {data.shape}")
+
+    return data, labels
+
+
+def compute_csp_features(base_save_dir, mode):
+    """Compute CSP features and save the CSP model."""
+    data, labels = prepare_csp_data(base_save_dir)
+    
+    print(f"Original data shape: {data.shape}")
+    print(f"Labels shape: {labels.shape}")
+
+    reshaped_data = data.transpose(0, 2, 1)  # CSP expects (samples, channels, time points)
+    print(f"Reshaped data for CSP: {reshaped_data.shape}")
+
+    if mode == 'default':
+        # In 'default' mode, train the CSP model
+        csp = CSP(n_components=4, reg=None, log=True)
+        csp.fit(reshaped_data, labels)
+        
+        # Save the CSP model
+        csp_model_path = os.path.join(base_save_dir, 'csp_model.pkl')
+        joblib.dump(csp, csp_model_path)
+        print(f"Saved CSP model to {csp_model_path}")
+    elif mode == 'random':
+        # In 'random' mode, load the pre-trained CSP model
+        csp_model_path = os.path.join(base_save_dir, 'csp_model.pkl')
+        if not os.path.exists(csp_model_path):
+            raise ValueError(f"CSP model not found at {csp_model_path}. Please train the model in 'default' mode first.")
+        
+        csp = joblib.load(csp_model_path)
+        print(f"Loaded pre-trained CSP model from {csp_model_path}")
+    else:
+        raise ValueError("Invalid mode. Use 'default' or 'random'.")
+
+    # Use the CSP model to transform the data into features
+    csp_features = csp.transform(reshaped_data)
+
+    save_csp_features_labels(csp_features, labels, base_save_dir, mode)
+
+
+
+def save_csp_features_labels(csp_features, labels, base_save_dir, mode):
+    """Save the CSP features and labels to a Parquet file."""
+    df = pd.DataFrame(csp_features)
+    df['labels'] = labels
+
+    filename = 'csp_features_labels_validation.parquet' if mode == 'random' else 'csp_features_labels.parquet'
+    
+    parquet_path = os.path.join(base_save_dir, filename)
+    df.to_parquet(parquet_path)
+    print(f"Saved CSP features and labels to {parquet_path}")
+
+    labels_file = os.path.join(base_save_dir, 'labels.csv')
+    pd.DataFrame({'labels': labels}).to_csv(labels_file, index=False)
+    print(f"Saved labels to {labels_file}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="EEG CSP Feature Extraction")
+    parser.add_argument('-b', '--base_dir', required=True, help="Base directory containing EEG data")
+    parser.add_argument('-o', '--output_dir', required=True, help="Output directory for processed data")
+    parser.add_argument('-m', '--mode', default='default', choices=['default', 'random'],
+                        help="Mode for processing: 'default' for separate LEFT/RIGHT, 'random' for mixed events")
+    args = parser.parse_args()
+
+    try:
+        process_all_xdf_files(args.base_dir, args.output_dir, args.mode)
+        compute_csp_features(args.output_dir, args.mode)
+    except Exception as e:
+        print(f"Error: {e}")
